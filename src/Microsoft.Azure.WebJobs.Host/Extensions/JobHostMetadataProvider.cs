@@ -4,10 +4,13 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Reflection;
+using System.Threading;
 using Microsoft.Azure.WebJobs.Description;
 using Microsoft.Azure.WebJobs.Host.Bindings;
 using Microsoft.Azure.WebJobs.Host.Config;
+using Microsoft.Azure.WebJobs.Host.Indexers;
 using Newtonsoft.Json.Linq;
 
 namespace Microsoft.Azure.WebJobs.Host
@@ -20,29 +23,38 @@ namespace Microsoft.Azure.WebJobs.Host
 
         // Map of simple assembly name to assembly.
         private readonly Dictionary<string, Assembly> _resolvedAssemblies = new Dictionary<string, Assembly>(StringComparer.OrdinalIgnoreCase);
-                
+
         private IBindingProvider _root;
 
-        public JobHostMetadataProvider()
+        private readonly IFunctionIndexProvider _functionIndexProvider;
+        private readonly IExtensionRegistry _extensionRegistry;
+        private readonly IBindingProvider _bindingProvider;
+        private readonly IConverterManager _converter;
+
+        public JobHostMetadataProvider(IFunctionIndexProvider functionIndexProvider, IExtensionRegistry extensionRegistry, IBindingProvider bindingProvider, IConverterManager converter)
         {
+            _functionIndexProvider = functionIndexProvider;
+            _extensionRegistry = extensionRegistry;
+            _bindingProvider = bindingProvider;
+            _converter = converter;
         }
 
-        internal void Initialize(IBindingProvider bindingProvider, ConverterManager converter, IExtensionRegistry extensionRegistry)
+        internal void Initialize()
         {
-            foreach (var extension in extensionRegistry.GetExtensions<IExtensionConfigProvider>())
+            foreach (var extension in _extensionRegistry.GetExtensions<IExtensionConfigProvider>())
             {
                 this.AddExtension(extension);
             }
 
-            this._root = bindingProvider;
+            this._root = _bindingProvider;
 
             // Populate assembly resolution from converters.            
-            if (converter != null)
+            if (_converter != null)
             {
-                converter.AddAssemblies((type) => this.AddAssembly(type));
+               // _converter.AddAssemblies((type) => AddAssembly(type));
             }
 
-            AddTypesFromGraph(bindingProvider as IBindingRuleProvider);
+            AddTypesFromGraph(_bindingProvider as IBindingRuleProvider);
         }
 
         // Resolve an assembly from the given name. 
@@ -50,7 +62,7 @@ namespace Microsoft.Azure.WebJobs.Host
         //    Name
         //    Name, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null
         public bool TryResolveAssembly(string assemblyName, out Assembly assembly)
-        {            
+        {
             // Give precedence to the full name. This can be important if multiple assemblies are loaded side-by-side.
             if (!_resolvedAssemblies.TryGetValue(assemblyName, out assembly))
             {
@@ -81,7 +93,7 @@ namespace Microsoft.Azure.WebJobs.Host
                     if (type.GetCustomAttribute(typeof(BindingAttribute)) != null)
                     {
                         yield return type;
-                    }                    
+                    }
                 }
             }
         }
@@ -90,7 +102,7 @@ namespace Microsoft.Azure.WebJobs.Host
         public void AddExtension(IExtensionConfigProvider extension)
         {
             AddAttributesFromAssembly(extension.GetType().Assembly);
-            AddAssembly(extension.GetType());         
+            AddAssembly(extension.GetType());
         }
 
         private void AddAssembly(Type type)
@@ -151,39 +163,62 @@ namespace Microsoft.Azure.WebJobs.Host
             metadata = (JObject)metadata.DeepClone(); // avoid mutating the inpout 
 
             JToken token;
-            if (attributeType == typeof(BlobAttribute) ||
-                attributeType == typeof(BlobTriggerAttribute))
+            if (attributeType.Name == "BlobAttribute" ||
+                attributeType.Name == "BlobTriggerAttribute")
             {
-                // Path --> BlobPath                
+                // Path --> BlobPath
                 if (metadata.TryGetValue("path", StringComparison.OrdinalIgnoreCase, out token))
                 {
                     metadata["BlobPath"] = token;
                 }
+            }
 
-                if (metadata.TryGetValue("direction", StringComparison.OrdinalIgnoreCase, out token))
+            if (string.Equals(attributeType.Name, "ServiceBusAttribute", StringComparison.OrdinalIgnoreCase))
+            {
+                // queueName --> queueOrTopicName, topicName --> queueOrTopicName
+                if (metadata.TryGetValue("queueName", StringComparison.OrdinalIgnoreCase, out token))
                 {
-                    FileAccess access;
-                    switch (token.ToString().ToLowerInvariant())
+                    metadata["queueOrTopicName"] = token;
+                    metadata["entityType"] = "Queue";
+                }
+                else if (metadata.TryGetValue("topicName", StringComparison.OrdinalIgnoreCase, out token))
+                {
+                    metadata["queueOrTopicName"] = token;
+                    metadata["entityType"] = "Topic";
+                }
+            }
+
+            // Other "look like a stream" attributes may expose an Access property for stream direction. 
+            var prop = attributeType.GetProperty("Access", BindingFlags.Instance | BindingFlags.Public);
+            if (prop != null)
+            {
+                if (prop.PropertyType == typeof(FileAccess?))
+                {
+                    if (metadata.TryGetValue("direction", StringComparison.OrdinalIgnoreCase, out token))
                     {
-                        case "in":
-                            access = FileAccess.Read;
-                            break;
-                        case "out":
-                            access = FileAccess.Write;
-                            break;
-                        case "inout":
-                            access = FileAccess.ReadWrite;
-                            break;
-                        default:
-                            throw new InvalidOperationException($"Illegal direction value: '{token}'");
+                        FileAccess access;
+                        switch (token.ToString().ToLowerInvariant())
+                        {
+                            case "in":
+                                access = FileAccess.Read;
+                                break;
+                            case "out":
+                                access = FileAccess.Write;
+                                break;
+                            case "inout":
+                                access = FileAccess.ReadWrite;
+                                break;
+                            default:
+                                throw new InvalidOperationException($"Illegal direction value: '{token}'");
+                        }
+                        metadata["access"] = access.ToString();
                     }
-                    metadata["access"] = access.ToString();
                 }
             }
 
             return metadata;
         }
-             
+
         // Get a better implementation 
         public Type GetDefaultType(
             Attribute attribute,
@@ -203,27 +238,44 @@ namespace Microsoft.Azure.WebJobs.Host
             IBindingRuleProvider root = (IBindingRuleProvider)providers;
             var type = root.GetDefaultType(attribute, access, requestedType);
 
-            if ((type == null) && (access == FileAccess.Read))
+            if (type == null)
             {
-                // For input bindings, if we have a specific requested type, then return and try to bind against that. 
-                // ITriggerBindingProvider doesn't provide rules. 
-                if (requestedType != typeof(object))
+                if (access == FileAccess.Read)
                 {
-                    return requestedType;
+                    // For input bindings, if we have a specific requested type, then return and try to bind against that. 
+                    // ITriggerBindingProvider doesn't provide rules.
+                    if (requestedType != typeof(object))
+                    {
+                        return requestedType;
+                    }
+                    else
+                    {
+                        // common default. If binder doesn't support this, it will fail later in the pipeline. 
+                        return typeof(String);
+                    }
                 }
-                else
+
+                // IBindingProvider does not provide rules. Attempt to use IAsyncCollector<string>.
+                if (access == FileAccess.Write)
                 {
-                    // common default. If binder doesn't support this, it will fail later in the pipeline. 
-                    return typeof(String); 
+                    return typeof(IAsyncCollector<string>);
                 }
             }
 
             if (type == null)
             {
-                throw new InvalidOperationException($"Can't bind {attribute.GetType().Name} to a script-compatible type for {access} access" + 
-                    ((requestedType != null) ? $"to { requestedType.Name }." : "."));
+                throw new InvalidOperationException($"Can't bind {attribute.GetType().Name} to a script-compatible type for {access} access" +
+                    ((requestedType != null) ? $" to { requestedType.Name }." : "."));
             }
             return type;
+        }
+
+        public BindingRule[] GetRules()
+        {
+            var providers = this._root;
+
+            IBindingRuleProvider root = (IBindingRuleProvider)providers;
+            return root.GetRules().ToArray();
         }
 
         /// <summary>
@@ -253,25 +305,42 @@ namespace Microsoft.Azure.WebJobs.Host
                 {
                     foreach (var converterType in rule.Converters)
                     {
-                        output.Write($"{ConverterManager.ExactMatch.TypeToString(converterType)}-->");
+                        output.Write($"{OpenType.ExactMatch.TypeToString(converterType)}-->");
                     }
                 }
 
                 output.Write(rule.UserType.GetDisplayName());
                 output.WriteLine();
-            }          
+            }
         }
 
         private void AddTypesFromGraph(IBindingRuleProvider root)
         {
             foreach (var rule in root.GetRules())
             {
-                var type = rule.UserType as ConverterManager.ExactMatch;
-                if (type != null)                
+                var type = rule.UserType as OpenType.ExactMatch;
+                if (type != null)
                 {
                     AddAssembly(type.ExactType);
                 }
             }
+        }
+
+        public FunctionMetadata GetFunctionMetadata(string functionName)
+        {
+            FunctionMetadata result = null;
+
+            var index = _functionIndexProvider.GetAsync(CancellationToken.None).GetAwaiter().GetResult();
+            var functionDefinition = index.LookupByName(functionName);
+            if (functionDefinition != null)
+            {
+                result = new FunctionMetadata()
+                {
+                    IsDisabled = functionDefinition.Descriptor.IsDisabled
+                };
+            }
+
+            return result;
         }
     }
 }

@@ -2,6 +2,7 @@
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
+using Microsoft.Azure.WebJobs.Description;
 
 namespace Microsoft.Azure.WebJobs
 {
@@ -20,10 +21,11 @@ namespace Microsoft.Azure.WebJobs
     /// <description>Flags the function as an available job function.</description>
     /// </item>
     /// </list>
-    /// In both cases, functions marked with this attribute are never called automatically by JobHost (during
-    /// RunAndBlock). Instead, they must be invoked manually using the Call method.
+    /// In both cases, functions marked with this attribute are never called automatically by JobHost when running.
+    /// Instead, they must be invoked manually using the Call method.
     /// </remarks>
     [AttributeUsage(AttributeTargets.Method)]
+    [Binding]
     public sealed class NoAutomaticTriggerAttribute : Attribute
     {
     }

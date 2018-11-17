@@ -3,7 +3,9 @@
 
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using Microsoft.Azure.WebJobs.Description;
+using Microsoft.Extensions.Configuration;
 
 namespace Microsoft.Azure.WebJobs.Host.Config
 {
@@ -13,74 +15,92 @@ namespace Microsoft.Azure.WebJobs.Host.Config
     /// </summary>
     public class ExtensionConfigContext : FluentConverterRules<Attribute, ExtensionConfigContext>
     {
+
         // List of actions to flush from the fluent configuration. 
         private List<Action> _updates = new List<Action>();
 
-        // track which TAttribute rules have been added. 
-        private HashSet<object> _existingRules = new HashSet<object>();
+        // Map of tyepof(TAttribute) --> FluentBindingRule<TAttribute>
+        private readonly Dictionary<Type, object> _rules = new Dictionary<Type, object>();
+        private readonly IConfiguration _configuration;
+        private readonly IConverterManager _converterManager;
+        private readonly IWebHookProvider _webHookProvider;
+        private readonly IExtensionRegistry _extensionRegistry;
+        private readonly INameResolver _nameResolver;
+
+        public ExtensionConfigContext(IConfiguration configuration, INameResolver nameResolver, IConverterManager converterManager, IWebHookProvider webHookProvider, IExtensionRegistry extensionRegistry)
+        {
+            _configuration = configuration;
+            _converterManager = converterManager;
+            _webHookProvider = webHookProvider;
+            _extensionRegistry = extensionRegistry;
+            _nameResolver = nameResolver;
+        }
 
         internal IExtensionConfigProvider Current { get; set; }
 
-        /// <summary>
-        /// Gets or sets the <see cref="JobHostConfiguration"/>.
-        /// </summary>
-        public JobHostConfiguration Config { get; set; }
-
-        /// <summary>
-        /// Gets or sets the <see cref="TraceWriter"/>.
-        /// </summary>
-        public TraceWriter Trace { get; set; }
-
-        internal override IConverterManager Converters
-        {
-            get
-            {
-                return this.Config.ConverterManager;
-            }
-        }
-
-        internal ServiceProviderWrapper PerHostServices { get; set; }
+        internal override ConverterManager ConverterManager => (ConverterManager)_converterManager;
 
         /// <summary>
         /// Get a fully qualified URL that the host will resolve to this extension 
         /// </summary>
         /// <returns>null if http handlers are not supported in this environment</returns>
+        /// $$$ Shouldn't be here
         [Obsolete("preview")]
         public Uri GetWebhookHandler()
         {
-            var webhook = this.Config.GetService<IWebHookProvider>();
-            if (webhook == null)
+            if (_webHookProvider == null)
             {
                 return null;
-            }            
-            return webhook.GetUrl(this.Current);            
+            }
+            return _webHookProvider.GetUrl(this.Current);
+        }
+
+        // Ensure that multiple attempts bind to the same attribute, they get the same rule object. 
+        private FluentBindingRule<TAttribute> GetOrCreate<TAttribute>()
+              where TAttribute : Attribute
+        {
+            FluentBindingRule<TAttribute> rule;
+            if (!this._rules.TryGetValue(typeof(TAttribute), out object temp))
+            {
+                // Create and register
+                rule = new FluentBindingRule<TAttribute>(_configuration, _nameResolver, _converterManager, _extensionRegistry);
+                this._rules[typeof(TAttribute)] = rule;
+
+                _updates.Add(rule.ApplyRules);
+            }
+            else
+            {
+                // Return existing.
+                rule = (FluentBindingRule<TAttribute>)temp;
+            }
+            return rule;
         }
 
         /// <summary>
-        /// Add a binding rule for the given attribute
+        /// Add a binding rule for the given attribute. 
+        /// Multiple extensions can add rules to the same attribute. 
         /// </summary>
         /// <typeparam name="TAttribute"></typeparam>
         /// <returns></returns>
         public FluentBindingRule<TAttribute> AddBindingRule<TAttribute>() where TAttribute : Attribute
         {
-            bool hasBindingAttr = typeof(TAttribute).GetCustomAttributes(typeof(BindingAttribute), false).Length > 0;
-            if (!hasBindingAttr)
-            {                
+            var bindingAttrs = typeof(TAttribute).GetCustomAttributes(typeof(BindingAttribute), false);
+            if (!bindingAttrs.Any())
+            {
                 throw new InvalidOperationException($"Can't add a binding rule for '{typeof(TAttribute).Name}' since it is missing the a {typeof(BindingAttribute).Name}");
             }
 
-            if (!_existingRules.Add(typeof(TAttribute)))
+            var isTrigger = typeof(TAttribute).Name.EndsWith("TriggerAttribute", StringComparison.OrdinalIgnoreCase);
+            if (!isTrigger && ((BindingAttribute)bindingAttrs.First()).TriggerHandlesReturnValue)
             {
-                throw new InvalidOperationException($"Only call AddBindingRule once per attribute type.");
+                throw new InvalidOperationException($"Only declare {nameof(BindingAttribute.TriggerHandlesReturnValue)} property true for trigger bindings.");
             }
 
-            var fluent = new FluentBindingRule<TAttribute>(this.Config);
-            _updates.Add(fluent.ApplyRules);
+            var fluent = GetOrCreate<TAttribute>();
             return fluent;
         }
 
-        // Called after we return from the extension's intitialize code. 
-        // This will apply the rules and update the config. 
+        // Called once after all extensions. 
         internal void ApplyRules()
         {
             foreach (var func in _updates)
@@ -89,5 +109,5 @@ namespace Microsoft.Azure.WebJobs.Host.Config
             }
             _updates.Clear();
         }
-    }    
+    }
 }

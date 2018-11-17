@@ -1,20 +1,19 @@
 ﻿// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
-using Microsoft.Azure.WebJobs.Host.Config;
-using Microsoft.Azure.WebJobs.Host.Indexers;
-using Microsoft.Azure.WebJobs.Host.TestCommon;
 using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
 using System.Threading.Tasks;
+using Microsoft.Azure.WebJobs.Description;
+using Microsoft.Azure.WebJobs.Host.Config;
+using Microsoft.Azure.WebJobs.Host.TestCommon;
+using Microsoft.Extensions.Hosting;
 using Xunit;
 
 namespace Microsoft.Azure.WebJobs.Host.UnitTests.Common
 {
     public class ValidationTests
     {
+        [Binding]
         public class TestAttribute : Attribute
         {
             public bool Bad { get; set; }
@@ -56,12 +55,12 @@ namespace Microsoft.Azure.WebJobs.Host.UnitTests.Common
         {
             public void Bad([Test(Bad = true, Path = "%k1%-{k2}")] Widget x)
             {
-            }        
+            }
         }
 
         public class GoodFunction : FunctionBase
         {
-            public void Good([Test(Bad= false, Path = "%k1%-{k2}")] Widget x)
+            public void Good([Test(Bad = false, Path = "%k1%-{k2}")] Widget x)
             {
             }
         }
@@ -70,11 +69,10 @@ namespace Microsoft.Azure.WebJobs.Host.UnitTests.Common
         {
             public void Initialize(ExtensionConfigContext context)
             {
-                var bf = context.Config.BindingFactory;
-
                 // Add [Test] support                
-                var rule = bf.BindToInput<TestAttribute, Widget>(this);
-                context.RegisterBindingRules<TestAttribute>(ValidateAtIndexTime, rule);
+                var rule = context.AddBindingRule<TestAttribute>();
+                rule.AddValidator(ValidateAtIndexTime);
+                rule.BindToInput<Widget>(this);
             }
 
             public Widget Convert(TestAttribute attr)
@@ -92,19 +90,26 @@ namespace Microsoft.Azure.WebJobs.Host.UnitTests.Common
         public void TestValidatorFails()
         {
             var nr = new FakeNameResolver().Add("k1", "v1");
-            var host = TestHelpers.NewJobHost<BadFunction>(new FakeExtClient(), nr);
+
+            IHost host = new HostBuilder()
+                .ConfigureDefaultTestHost<BadFunction>(b => { b.AddExtension<FakeExtClient>(); }, nr)
+                .Build();
 
             TestHelpers.AssertIndexingError(
-                () => host.Call("Valid"),
+                () => host.GetJobHost<BadFunction>().CallAsync("Valid").GetAwaiter().GetResult(),
                 "BadFunction.Bad", TestAttribute.ErrorMessage);
         }
 
         [Fact]
-        public void TestValidatorSucceeds()
+        public async Task TestValidatorSucceeds()
         {
             var nr = new FakeNameResolver().Add("k1", "v1");
-            var host = TestHelpers.NewJobHost<GoodFunction>(new FakeExtClient(), nr);
-            host.Call("Good", new { k2 = "xxxx" } ); 
+
+            IHost host = new HostBuilder()
+                .ConfigureDefaultTestHost<GoodFunction>(b => { b.AddExtension<FakeExtClient>(); }, nr)
+                .Build();
+
+            await host.GetJobHost<GoodFunction>().CallAsync("Good", new { k2 = "xxxx" });
         }
 
         // Register [Test]  with 2 rules and a local validator. 
@@ -114,14 +119,10 @@ namespace Microsoft.Azure.WebJobs.Host.UnitTests.Common
         {
             public void Initialize(ExtensionConfigContext context)
             {
-                var bf = context.Config.BindingFactory;
-
                 // Add [Test] support
-                var rule1 = bf.BindToInput<TestAttribute, Widget>(this);
-                var rule2 = bf.BindToInput<TestAttribute, Widget2>(this);
-                var rule2Validator = bf.AddValidator<TestAttribute>(LocalValidator, rule2);
-
-                context.RegisterBindingRules<TestAttribute>(rule2Validator, rule1);
+                var rule = context.AddBindingRule<TestAttribute>();
+                rule.BindToInput<Widget>(this);
+                rule.BindToInput<Widget2>(this).AddValidator(LocalValidator);
             }
 
             Widget IConverter<TestAttribute, Widget>.Convert(TestAttribute attr)
@@ -158,13 +159,19 @@ namespace Microsoft.Azure.WebJobs.Host.UnitTests.Common
         }
 
         [Fact]
-        public void TestLocalValidatorSkipped()
+        public async Task TestLocalValidatorSkipped()
         {
             // Local validator only run if we use the given rule. 
             var nr = new FakeNameResolver().Add("k1", "v1");
-            var host = TestHelpers.NewJobHost<LocalFunction1>(new FakeExtClient2(), nr);
 
-            host.Call("NoValidation", new { k2 = "xxxx" }); // Succeeds since validate doesn't run on this rule             
+            IHost host = new HostBuilder()
+                .ConfigureDefaultTestHost<LocalFunction1>(b=> 
+                {
+                    b.AddExtension<FakeExtClient2>();
+                }, nameResolver: nr)
+                .Build();
+
+            await host.GetJobHost<LocalFunction1>().CallAsync("NoValidation", new { k2 = "xxxx" }); // Succeeds since validate doesn't run on this rule             
         }
 
         [Fact]
@@ -172,10 +179,16 @@ namespace Microsoft.Azure.WebJobs.Host.UnitTests.Common
         {
             // Local validator only run if we use the given rule. 
             var nr = new FakeNameResolver().Add("k1", "v1");
-            var host = TestHelpers.NewJobHost<LocalFunction2>(new FakeExtClient2(), nr);
+
+            IHost host = new HostBuilder()
+                .ConfigureDefaultTestHost<LocalFunction2>(b =>
+                {
+                    b.AddExtension<FakeExtClient2>();
+                }, nr)
+                .Build();
 
             TestHelpers.AssertIndexingError(
-                () => host.Call("WithValidation"),
+                () => host.GetJobHost<LocalFunction2>().CallAsync("WithValidation").GetAwaiter().GetResult(),
                 "LocalFunction2.WithValidation", TestAttribute.ErrorMessage);
         }
     }

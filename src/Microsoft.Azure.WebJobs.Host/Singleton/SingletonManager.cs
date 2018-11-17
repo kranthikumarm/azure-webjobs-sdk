@@ -15,22 +15,30 @@ using Microsoft.Azure.WebJobs.Host.Protocols;
 using Microsoft.Azure.WebJobs.Host.Timers;
 using Microsoft.Azure.WebJobs.Logging;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 
 namespace Microsoft.Azure.WebJobs.Host
 {
+
+    // $$$
+    // Wraps SingletonManager and  exposes to extensions 
+    public interface IHostSingletonManager
+    {
+        IListener CreateHostSingletonListener(IListener innerListener, string scopeId);
+    }
+
     /// <summary>
     /// Encapsulates and manages blob leases for Singleton locks.
     /// </summary>
-    internal class SingletonManager
-    {        
+    internal class SingletonManager : IHostSingletonManager
+    {
         private readonly INameResolver _nameResolver;
-        private readonly SingletonConfiguration _config;        
+        private readonly SingletonOptions _options;
         private readonly ILogger _logger;
         private readonly ILoggerFactory _loggerFactory;
         private readonly IDistributedLockManager _lockManager;
         private readonly IWebJobsExceptionHandler _exceptionHandler;
 
-        private TraceWriter _trace;
         private IHostIdProvider _hostIdProvider;
         private string _hostId;
 
@@ -41,13 +49,12 @@ namespace Microsoft.Azure.WebJobs.Host
         {
         }
 
-        public SingletonManager(IDistributedLockManager lockManager, SingletonConfiguration config,
-            TraceWriter trace, IWebJobsExceptionHandler exceptionHandler, ILoggerFactory loggerFactory, IHostIdProvider hostIdProvider, INameResolver nameResolver = null)
+        public SingletonManager(IDistributedLockManager lockManager, IOptions<SingletonOptions> options, IWebJobsExceptionHandler exceptionHandler,
+            ILoggerFactory loggerFactory, IHostIdProvider hostIdProvider, INameResolver nameResolver = null)
         {
             _lockManager = lockManager;
             _nameResolver = nameResolver;
-            _config = config;
-            _trace = trace;
+            _options = options.Value;
             _loggerFactory = loggerFactory;
             _exceptionHandler = exceptionHandler;
             _logger = _loggerFactory?.CreateLogger(LogCategories.Singleton);
@@ -67,11 +74,11 @@ namespace Microsoft.Azure.WebJobs.Host
             }
         }
 
-        internal virtual SingletonConfiguration Config
+        internal virtual SingletonOptions Options
         {
             get
             {
-                return _config;
+                return _options;
             }
         }
 
@@ -89,13 +96,11 @@ namespace Microsoft.Azure.WebJobs.Host
 
         public async virtual Task<RenewableLockHandle> LockAsync(string lockId, string functionInstanceId, SingletonAttribute attribute, CancellationToken cancellationToken)
         {
-            RenewableLockHandle lockHandle = await TryLockAsync(lockId, functionInstanceId, attribute, cancellationToken);
+            var lockHandle = await TryLockAsync(lockId, functionInstanceId, attribute, cancellationToken);
 
             if (lockHandle == null)
             {
-                TimeSpan acquisitionTimeout = attribute.LockAcquisitionTimeout != null
-                    ? TimeSpan.FromSeconds(attribute.LockAcquisitionTimeout.Value) :
-                    _config.LockAcquisitionTimeout;
+                TimeSpan acquisitionTimeout = GetLockAcquisitionTimeout(attribute, _options);
                 throw new TimeoutException(string.Format("Unable to acquire singleton lock blob lease for blob '{0}' (timeout of {1} exceeded).", lockId, acquisitionTimeout.ToString("g")));
             }
 
@@ -104,22 +109,19 @@ namespace Microsoft.Azure.WebJobs.Host
 
         public async virtual Task<RenewableLockHandle> TryLockAsync(string lockId, string functionInstanceId, SingletonAttribute attribute, CancellationToken cancellationToken, bool retry = true)
         {
-            TimeSpan lockPeriod = GetLockPeriod(attribute, _config);
+            TimeSpan lockPeriod = GetLockPeriod(attribute, _options);
             IDistributedLock handle = await _lockManager.TryLockAsync(attribute.Account, lockId, functionInstanceId, null, lockPeriod, cancellationToken);
 
             if ((handle == null) && retry)
             {
                 // Someone else has the lease. Continue trying to periodically get the lease for
                 // a period of time
-                TimeSpan acquisitionTimeout = attribute.LockAcquisitionTimeout != null
-                    ? TimeSpan.FromSeconds(attribute.LockAcquisitionTimeout.Value) :
-                    _config.LockAcquisitionTimeout;
-
+                TimeSpan acquisitionTimeout = GetLockAcquisitionTimeout(attribute, _options);
                 TimeSpan timeWaited = TimeSpan.Zero;
                 while ((handle == null) && (timeWaited < acquisitionTimeout))
                 {
-                    await Task.Delay(_config.LockAcquisitionPollingInterval);
-                    timeWaited += _config.LockAcquisitionPollingInterval;
+                    await Task.Delay(_options.LockAcquisitionPollingInterval);
+                    timeWaited += _options.LockAcquisitionPollingInterval;
                     handle = await _lockManager.TryLockAsync(attribute.Account, lockId, functionInstanceId, null, lockPeriod, cancellationToken);
                 }
             }
@@ -136,7 +138,6 @@ namespace Microsoft.Azure.WebJobs.Host
             renewal.Start();
 
             string msg = string.Format(CultureInfo.InvariantCulture, "Singleton lock acquired ({0})", lockId);
-            _trace.Verbose(msg, source: TraceSource.Execution);
             _logger?.LogDebug(msg);
 
             return new RenewableLockHandle(handle, renewal);
@@ -152,7 +153,7 @@ namespace Microsoft.Azure.WebJobs.Host
             return new TaskSeriesTimer(command, this._exceptionHandler, Task.Delay(normalUpdateInterval));
         }
 
-        internal static TimeSpan GetLockPeriod(SingletonAttribute attribute, SingletonConfiguration config)
+        internal static TimeSpan GetLockPeriod(SingletonAttribute attribute, SingletonOptions config)
         {
             return attribute.Mode == SingletonMode.Listener ?
                     config.ListenerLockPeriod : config.LockPeriod;
@@ -164,11 +165,10 @@ namespace Microsoft.Azure.WebJobs.Host
             {
                 await handle.LeaseRenewalTimer.StopAsync(cancellationToken);
             }
-                        
+
             await _lockManager.ReleaseLockAsync(handle.InnerLock, cancellationToken);
 
             string msg = string.Format(CultureInfo.InvariantCulture, "Singleton lock released ({0})", handle.InnerLock.LockId);
-            _trace.Verbose(msg, source: TraceSource.Execution);
             _logger?.LogDebug(msg);
         }
 
@@ -250,13 +250,13 @@ namespace Microsoft.Azure.WebJobs.Host
         /// <param name="innerListener">The inner listener to wrap.</param>
         /// <param name="scopeId">The scope ID to use.</param>
         /// <returns>The singleton listener.</returns>
-        public SingletonListener CreateHostSingletonListener(IListener innerListener, string scopeId)
+        public IListener CreateHostSingletonListener(IListener innerListener, string scopeId)
         {
             SingletonAttribute singletonAttribute = new SingletonAttribute(scopeId, SingletonScope.Host)
             {
                 Mode = SingletonMode.Listener
             };
-            return new SingletonListener(null, singletonAttribute, this, innerListener, _trace, _loggerFactory);
+            return new SingletonListener(null, singletonAttribute, this, innerListener, _loggerFactory);
         }
 
         public static SingletonAttribute GetListenerSingletonOrNull(Type listenerType, FunctionDescriptor method)
@@ -284,6 +284,15 @@ namespace Microsoft.Azure.WebJobs.Host
             }
 
             return singletonAttribute;
+        }
+
+        internal static TimeSpan GetLockAcquisitionTimeout(SingletonAttribute attribute, SingletonOptions config)
+        {
+            TimeSpan acquisitionTimeout = attribute.LockAcquisitionTimeout != -1
+                    ? TimeSpan.FromSeconds(attribute.LockAcquisitionTimeout)
+                    : config.LockAcquisitionTimeout;
+
+            return acquisitionTimeout;
         }
 
         internal static void ValidateSingletonAttribute(SingletonAttribute attribute, SingletonMode mode)
@@ -318,12 +327,12 @@ namespace Microsoft.Azure.WebJobs.Host
             }
 
             public async Task<TaskSeriesCommandResult> ExecuteAsync(CancellationToken cancellationToken)
-            {                
+            {
                 // Exceptions wil propagate 
                 bool executionSucceeded = await _lockManager.RenewAsync(_lock, cancellationToken);
 
                 TimeSpan delay = _speedupStrategy.GetNextDelay(executionSucceeded: true);
-                return new TaskSeriesCommandResult(wait: Task.Delay(delay));                
+                return new TaskSeriesCommandResult(wait: Task.Delay(delay));
             }
         }
     }

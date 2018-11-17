@@ -3,45 +3,67 @@
 
 using System.Collections.Generic;
 using System.Threading.Tasks;
+using Microsoft.Azure.WebJobs.Host.Config;
+using Microsoft.Azure.WebJobs.Host.Executors;
 using Microsoft.Azure.WebJobs.Host.Indexers;
+using Microsoft.Extensions.Options;
 using Xunit;
 
 namespace Microsoft.Azure.WebJobs.Host.TestCommon
 {
-    public class TestJobHost<TProgram> : JobHost
+    public class JobHost<TProgram> : JobHost
     {
-        public TestJobHost(JobHostConfiguration config)
-            : base(config)
+        private readonly IJobActivator _jobActivator;
+
+        public JobHost(
+            IOptions<JobHostOptions> options, 
+            IJobHostContextFactory contextFactory,
+            IJobActivator jobActivator)
+            : base(options, contextFactory)
         {
+            _jobActivator = jobActivator;
         }
 
-        public void Call(string methodName)
+        public async Task CallAsync(string methodName, object arguments = null)
         {
-            base.Call(typeof(TProgram).GetMethod(methodName));
+            await base.CallAsync(methodName, arguments);
         }
 
-        public void Call(string methodName, object arguments)
+        public async Task CallAsync(string methodName, IDictionary<string, object> arguments)
         {
-            base.Call(typeof(TProgram).GetMethod(methodName), arguments);
+            await base.CallAsync(typeof(TProgram).GetMethod(methodName), arguments);
         }
 
-        public void Call(string methodName, IDictionary<string, object> arguments)
+        // Start listeners and run until the Task source is set. 
+        public async Task<TResult> RunTriggerAsync<TResult>(TaskCompletionSource<TResult> taskSource= null)
         {
-            base.Call(typeof(TProgram).GetMethod(methodName), arguments);
-        }
+            // Program was registered with the job activator, so we can get it
+            TProgram prog = _jobActivator.CreateInstance<TProgram>();
+            if (taskSource == null)
+            {
+                var progResult = prog as IProgramWithResult<TResult>;
+                taskSource = new TaskCompletionSource<TResult>();
+                progResult.TaskSource = taskSource;
+            }
 
-        public Task CallAsync(string methodName, object arguments)
-        {
-            return base.CallAsync(typeof(TProgram).GetMethod(methodName), arguments);
+            TResult result = default(TResult);
+            // Act
+            using (this)
+            {
+                await this.StartAsync();
+                // Assert
+                result = await TestHelpers.AwaitWithTimeout(taskSource);
+            }
+            return result;
         }
 
         // Helper for quickly testing indexing errors 
-        public void AssertIndexingError(string methodName, string expectedErrorMessage)
+        public async Task AssertIndexingError(string methodName, string expectedErrorMessage)
         {
             try
             {
                 // Indexing is lazy, so must actually try a call first. 
-                this.Call(methodName);
+                await this.CallAsync(methodName);
             }
             catch (FunctionIndexingException e)
             {
@@ -52,5 +74,11 @@ namespace Microsoft.Azure.WebJobs.Host.TestCommon
             }
             Assert.True(false, "Invoker should have failed");
         }
+    }
+
+    // $$$ Meanth to simplify some tests - is this worth it? 
+    public interface IProgramWithResult<TResult>
+    {
+        TaskCompletionSource<TResult> TaskSource { get; set; }
     }
 }

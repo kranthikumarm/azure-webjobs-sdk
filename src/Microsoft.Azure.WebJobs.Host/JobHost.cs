@@ -16,7 +16,7 @@ using Microsoft.Azure.WebJobs.Host.Listeners;
 using Microsoft.Azure.WebJobs.Host.Protocols;
 using Microsoft.Azure.WebJobs.Logging;
 using Microsoft.Extensions.Logging;
-using Microsoft.WindowsAzure.Storage;
+using Microsoft.Extensions.Options;
 
 namespace Microsoft.Azure.WebJobs
 {
@@ -24,14 +24,15 @@ namespace Microsoft.Azure.WebJobs
     /// A <see cref="JobHost"/> is the execution container for jobs. Once started, the
     /// <see cref="JobHost"/> will manage and run job functions when they are triggered.
     /// </summary>
-    public class JobHost : IDisposable, IJobInvoker
+    public class JobHost : IJobHost, IDisposable, IJobInvoker
     {
         private const int StateNotStarted = 0;
         private const int StateStarting = 1;
         private const int StateStarted = 2;
         private const int StateStoppingOrStopped = 3;
 
-        private readonly JobHostConfiguration _config;
+        private readonly JobHostOptions _options;
+        private readonly IJobHostContextFactory _jobHostContextFactory;
         private readonly CancellationTokenSource _shutdownTokenSource;
         private readonly WebJobsShutdownWatcher _shutdownWatcher;
         private readonly CancellationTokenSource _stoppingTokenSource;
@@ -44,52 +45,28 @@ namespace Microsoft.Azure.WebJobs
         // Points to a completed task after initialization. 
         private Task _initializationRunning = null;
 
-        // These are services that are accessible without starting the execution container. 
-        // They include the initial set of JobHostConfiguration services as well as 
-        // additional services created. 
-        private ServiceProviderWrapper _services;
-
         private int _state;
         private Task _stopTask;
         private bool _disposed;
 
-        // Common lock to protect fields. 
+        // Common lock to protect fields.
         private object _lock = new object();
 
         private ILogger _logger;
 
         /// <summary>
-        /// Initializes a new instance of the <see cref="JobHost"/> class, using a Microsoft Azure Storage connection
-        /// string located in the connectionStrings section of the configuration file or in environment variables.
-        /// </summary>
-        public JobHost()
-            : this(new JobHostConfiguration())
-        {
-        }
-
-        static JobHost()
-        {
-            // add webjobs to user agent for all storage calls
-            OperationContext.GlobalSendingRequest += (sender, e) =>
-            {
-                // TODO: FACAVAL - This is not supported on by the latest version of the
-                // storage SDK. Need to re-add this when the capability is reintroduced.
-                // e.UserAgent += " AzureWebJobs";
-            };
-        }
-
-        /// <summary>
         /// Initializes a new instance of the <see cref="JobHost"/> class using the configuration provided.
         /// </summary>
         /// <param name="configuration">The job host configuration.</param>
-        public JobHost(JobHostConfiguration configuration)
+        public JobHost(IOptions<JobHostOptions> options, IJobHostContextFactory jobHostContextFactory)
         {
-            if (configuration == null)
+            if (options == null)
             {
-                throw new ArgumentNullException("configuration");
+                throw new ArgumentNullException(nameof(options));
             }
 
-            _config = configuration;
+            _options = options.Value;
+            _jobHostContextFactory = jobHostContextFactory;
             _shutdownTokenSource = new CancellationTokenSource();
             _shutdownWatcher = WebJobsShutdownWatcher.Create(_shutdownTokenSource);
             _stoppingTokenSource = CancellationTokenSource.CreateLinkedTokenSource(_shutdownTokenSource.Token);
@@ -100,12 +77,6 @@ namespace Microsoft.Azure.WebJobs
         {
             get { return _listener; }
             set { _listener = value; }
-        }
-
-        /// <summary>Starts the host.</summary>
-        public void Start()
-        {
-            Task.Run(() => StartAsync()).GetAwaiter().GetResult();
         }
 
         /// <summary>Starts the host.</summary>
@@ -123,23 +94,18 @@ namespace Microsoft.Azure.WebJobs
             return StartAsyncCore(cancellationToken);
         }
 
-        private async Task StartAsyncCore(CancellationToken cancellationToken)
+        protected virtual async Task StartAsyncCore(CancellationToken cancellationToken)
         {
-            await EnsureHostStartedAsync(cancellationToken);
+            await EnsureHostInitializedAsync(cancellationToken);
 
             await _listener.StartAsync(cancellationToken);
 
+            OnHostStarted();
+
             string msg = "Job host started";
-            _context.Trace.Info(msg, Host.TraceSource.Host);
             _logger?.LogInformation(msg);
 
             _state = StateStarted;
-        }
-
-        /// <summary>Stops the host.</summary>
-        public void Stop()
-        {
-            Task.Run(() => StopAsync()).GetAwaiter().GetResult();
         }
 
         /// <summary>Stops the host.</summary>
@@ -168,59 +134,15 @@ namespace Microsoft.Azure.WebJobs
             return _stopTask;
         }
 
-        private async Task StopAsyncCore(CancellationToken cancellationToken)
+        protected virtual async Task StopAsyncCore(CancellationToken cancellationToken)
         {
             await _listener.StopAsync(cancellationToken);
 
             // Flush remaining logs
-            var functionEventCollector = _context.FunctionEventCollector;
-            if (functionEventCollector != null)
-            {
-                await functionEventCollector.FlushAsync(cancellationToken);
-            }
+            await _context.EventCollector.FlushAsync(cancellationToken);
 
             string msg = "Job host stopped";
-            _context.Trace.Info(msg, Host.TraceSource.Host);
             _logger?.LogInformation(msg);
-        }
-
-        /// <summary>Runs the host and blocks the current thread while the host remains running.</summary>
-        public void RunAndBlock()
-        {
-            Start();
-
-            // Wait for someone to begin stopping (_shutdownWatcher, Stop, or Dispose).
-            _stoppingTokenSource.Token.WaitHandle.WaitOne();
-
-            // Don't return until all executing functions have completed.
-            Stop();
-        }
-
-        /// <summary>Calls a job method.</summary>
-        /// <param name="method">The job method to call.</param>
-        public void Call(MethodInfo method)
-        {
-            Task.Run(() => CallAsync(method)).GetAwaiter().GetResult();
-        }
-
-        /// <summary>Calls a job method.</summary>
-        /// <param name="method">The job method to call.</param>
-        /// <param name="arguments">
-        /// An object with public properties representing argument names and values to bind to parameters in the job
-        /// method. In addition to parameter values, these may also include binding data values.
-        /// </param>
-        public void Call(MethodInfo method, object arguments)
-        {
-            Task.Run(() => CallAsync(method, arguments)).GetAwaiter().GetResult();
-        }
-
-        /// <summary>Calls a job method.</summary>
-        /// <param name="method">The job method to call.</param>
-        /// <param name="arguments">The argument names and values to bind to parameters in the job method.
-        /// In addition to parameter values, these may also include binding data values. </param>
-        public void Call(MethodInfo method, IDictionary<string, object> arguments)
-        {
-            Task.Run(() => CallAsync(method, arguments)).GetAwaiter().GetResult();
         }
 
         /// <summary>Calls a job method.</summary>
@@ -241,8 +163,23 @@ namespace Microsoft.Azure.WebJobs
         /// </param>
         /// <param name="cancellationToken">The token to monitor for cancellation requests.</param>
         /// <returns>A <see cref="Task"/> that will call the job method.</returns>
-        public Task CallAsync(MethodInfo method, object arguments,
-            CancellationToken cancellationToken = default(CancellationToken))
+        public Task CallAsync(MethodInfo method, object arguments, CancellationToken cancellationToken = default(CancellationToken))
+        {
+            ThrowIfDisposed();
+
+            IDictionary<string, object> argumentsDictionary = ObjectDictionaryConverter.AsDictionary(arguments);
+            return CallAsync(method, argumentsDictionary, cancellationToken);
+        }
+
+        /// <summary>Calls a job method.</summary>
+        /// <param name="method">The job method to call.</param>
+        /// <param name="arguments">
+        /// An object with public properties representing argument names and values to bind to parameters in the job
+        /// method. In addition to parameter values, these may also include binding data values. 
+        /// </param>
+        /// <param name="cancellationToken">The token to monitor for cancellation requests.</param>
+        /// <returns>A <see cref="Task"/> that will call the job method.</returns>
+        public Task CallAsync(string method, object arguments, CancellationToken cancellationToken = default(CancellationToken))
         {
             ThrowIfDisposed();
 
@@ -255,8 +192,7 @@ namespace Microsoft.Azure.WebJobs
         /// <param name="arguments">The argument names and values to bind to parameters in the job method. In addition to parameter values, these may also include binding data values. </param>
         /// <param name="cancellationToken">The token to monitor for cancellation requests.</param>
         /// <returns>A <see cref="Task"/> that will call the job method.</returns>
-        public Task CallAsync(MethodInfo method, IDictionary<string, object> arguments,
-            CancellationToken cancellationToken = default(CancellationToken))
+        public Task CallAsync(MethodInfo method, IDictionary<string, object> arguments, CancellationToken cancellationToken = default(CancellationToken))
         {
             if (method == null)
             {
@@ -273,8 +209,7 @@ namespace Microsoft.Azure.WebJobs
         /// <param name="arguments">The argument names and values to bind to parameters in the job method. In addition to parameter values, these may also include binding data values. </param>
         /// <param name="cancellationToken">The token to monitor for cancellation requests.</param>
         /// <returns>A <see cref="Task"/> that will call the job method.</returns>
-        public async Task CallAsync(string name, IDictionary<string, object> arguments = null,
-            CancellationToken cancellationToken = default(CancellationToken))
+        public async Task CallAsync(string name, IDictionary<string, object> arguments = null, CancellationToken cancellationToken = default(CancellationToken))
         {
             if (name == null)
             {
@@ -283,7 +218,7 @@ namespace Microsoft.Azure.WebJobs
 
             ThrowIfDisposed();
 
-            await EnsureHostStartedAsync(cancellationToken);
+            await EnsureHostInitializedAsync(cancellationToken);
 
             IFunctionDefinition function = _context.FunctionLookup.LookupByName(name);
             Validate(function, name);
@@ -297,10 +232,10 @@ namespace Microsoft.Azure.WebJobs
             }
         }
 
-        private async Task CallAsyncCore(MethodInfo method, IDictionary<string, object> arguments,
-            CancellationToken cancellationToken)
+        private async Task CallAsyncCore(MethodInfo method, IDictionary<string, object> arguments, CancellationToken cancellationToken)
         {
-            await EnsureHostStartedAsync(cancellationToken);
+            await EnsureHostInitializedAsync(cancellationToken);
+
             IFunctionDefinition function = _context.FunctionLookup.Lookup(method);
             Validate(function, method);
             IFunctionInstance instance = CreateFunctionInstance(function, arguments);
@@ -364,7 +299,7 @@ namespace Microsoft.Azure.WebJobs
         }
 
         private static void Validate(IFunctionDefinition function, object key)
-        { 
+        {
             if (function == null)
             {
                 string msg = String.Format(CultureInfo.CurrentCulture, "'{0}' can't be invoked from Azure WebJobs SDK. Is it missing Azure WebJobs SDK attributes?", key);
@@ -380,9 +315,13 @@ namespace Microsoft.Azure.WebJobs
             }
         }
 
-        // If multiple threads call this, only one should do the init. The rest should wait.
-        // When this task is signalled, _context is initialized. 
-        private Task EnsureHostStartedAsync(CancellationToken cancellationToken)
+        /// <summary>
+        /// Ensure all required host services are initialized and the host is ready to start
+        /// processing function invocations. This function does not start the listeners.
+        /// If multiple threads call this, only one should do the initialization. The rest should wait.
+        /// When this task is signalled, _context is initialized.
+        /// </summary>
+        private Task EnsureHostInitializedAsync(CancellationToken cancellationToken)
         {
             if (_context != null)
             {
@@ -404,7 +343,7 @@ namespace Microsoft.Azure.WebJobs
             if (tsc != null)
             {
                 // Ignore the return value and use tsc so that all threads are awaiting the same thing. 
-                Task ignore = RuntimeInitAsync(cancellationToken, tsc);
+                Task ignore = InitializeHostAsync(cancellationToken, tsc);
             }
 
             return _initializationRunning;
@@ -413,14 +352,15 @@ namespace Microsoft.Azure.WebJobs
         // Caller gaurantees this is single-threaded. 
         // Set initializationTask when complete, many threads can wait on that. 
         // When complete, the fields should be initialized to allow runtime usage. 
-        private async Task RuntimeInitAsync(CancellationToken cancellationToken, TaskCompletionSource<bool> initializationTask)
+        private async Task InitializeHostAsync(CancellationToken cancellationToken, TaskCompletionSource<bool> initializationTask)
         {
             try
             {
-                // Do real initialization 
-                PopulateStaticServices();
+                var context = await _jobHostContextFactory.Create(_shutdownTokenSource.Token, cancellationToken);
 
-                JobHostContext context = await _config.CreateJobHostContextAsync(_services, this, _shutdownTokenSource.Token, cancellationToken);
+                // must call this BEFORE setting the results below
+                // since listener startup is blocking on those members
+                OnHostInitialized();
 
                 _context = context;
                 _listener = context.Listener;
@@ -434,31 +374,19 @@ namespace Microsoft.Azure.WebJobs
             }
         }
 
-        // Ensure the static services are initialized. 
-        // These are derived from the underlying JobHostConfiguration. 
-        // Caller ensures this is single threaded. 
-        private void PopulateStaticServices()
+        /// <summary>
+        /// Called when host initialization has been completed, but before listeners
+        /// are started.
+        /// </summary>
+        protected virtual void OnHostInitialized()
         {
-            if (this._services != null)
-            {
-                return; // already Created 
-            }
-
-            var services = this._config.CreateStaticServices();
-
-            _services = services;
         }
 
         /// <summary>
-        /// Get set of services. 
+        /// Called when all listeners have started and the host is running.
         /// </summary>
-        public IServiceProvider Services
+        protected virtual void OnHostStarted()
         {
-            get
-            {
-                PopulateStaticServices();
-                return _services;
-            }
         }
     }
 }

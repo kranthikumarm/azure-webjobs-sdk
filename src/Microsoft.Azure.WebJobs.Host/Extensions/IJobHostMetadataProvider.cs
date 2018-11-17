@@ -11,6 +11,7 @@ namespace Microsoft.Azure.WebJobs.Host
     /// <summary>
     /// Interface for providing <see cref="JobHost"/> function binding metadata.
     /// </summary>
+    [Obsolete("Not ready for public consumption.")]
     public interface IJobHostMetadataProvider
     {
         /// <summary>
@@ -54,11 +55,12 @@ namespace Microsoft.Azure.WebJobs.Host
         /// <param name="assembly">Assembly that the name is resolved to</param>
         /// <returns>True with a non-null assembly if we were able to resolve. Else false and null assembly</returns>
         bool TryResolveAssembly(string assemblyName, out Assembly assembly);
-
+        
         /// <summary>
-        /// For diagnostics, dump the registered bindings and converters.
+        /// Gets function metadata.
         /// </summary>
-        /// <param name="output">The <see cref="TextWriter"/> to write the graph to.</param>
-        void DebugDumpGraph(TextWriter output);
+        /// <param name="functionName">Name of function to return metadata for.</param>
+        /// <returns></returns>
+        FunctionMetadata GetFunctionMetadata(string functionName);
     }
 }

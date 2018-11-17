@@ -5,16 +5,18 @@ using System;
 using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Azure.WebJobs.Description;
 using Microsoft.Azure.WebJobs.Host.Bindings;
 using Microsoft.Azure.WebJobs.Host.Config;
 using Microsoft.Azure.WebJobs.Host.TestCommon;
-using Microsoft.Azure.WebJobs.Host.UnitTests.Indexers;
+using Microsoft.Extensions.Hosting;
 using Newtonsoft.Json;
 using Xunit;
 
 namespace Microsoft.Azure.WebJobs.Host.UnitTests
 {
     // Tests for the BindToGenericItem rule. 
+    [Binding]
     public class FakeItemAttribute : Attribute
     {
         [AutoResolve]
@@ -43,36 +45,31 @@ namespace Microsoft.Azure.WebJobs.Host.UnitTests
         }
 
         [Fact]
-        public void Test()
+        public async Task Test()
         {
-            var nr = new DictNameResolver();
-            nr.Add("appsetting1", "val1");
-
             var client = new FakeItemClient();
             client._dict["ModifyInPlace"] = new Item
             {
                 Value = 123
             };
 
-            var host = TestHelpers.NewJobHost<Functions>(nr, client);
+            IHost host = new HostBuilder()
+                .ConfigureDefaultTestHost<Functions>(b =>
+                {
+                    b.AddExtension(client);
+                })
+                .Build();
 
             // With out parameter 
-            {
-                client._dict["SetToNull"] = new Item(); // should get ovewritten with null
-
-                host.Call("SetToNull");
-
-                var item = (Item)client._dict["SetToNull"];
-                Assert.Equal(null, item);
-            }
+            client._dict["SetToNull"] = new Item(); // should get ovewritten with null
+            await host.GetJobHost().CallAsync(typeof(Functions).GetMethod(nameof(Functions.SetToNull)));
+            var item = (Item)client._dict["SetToNull"];
+            Assert.Equal(null, item);
 
             // Modifying in-place
-            {
-                host.Call("ModifyInPlace");
-
-                var item = (Item)client._dict["ModifyInPlace"];
-                Assert.Equal(124, item.Value);
-            }
+            await host.GetJobHost().CallAsync(typeof(Functions).GetMethod(nameof(Functions.ModifyInPlace)));
+            item = (Item)client._dict["ModifyInPlace"];
+            Assert.Equal(124, item.Value);
         }
     }
 
@@ -82,12 +79,8 @@ namespace Microsoft.Azure.WebJobs.Host.UnitTests
 
         void IExtensionConfigProvider.Initialize(ExtensionConfigContext context)
         {
-            IExtensionRegistry extensions = context.Config.GetService<IExtensionRegistry>();
-            var bf = context.Config.BindingFactory;
-
-            var rule = bf.BindToGenericValueProvider<FakeItemAttribute>(BuildFromAttribute);
-
-            extensions.RegisterBindingRules<FakeItemAttribute>(rule);
+            var rule = context.AddBindingRule<FakeItemAttribute>();
+            rule.BindToValueProvider(BuildFromAttribute);
         }
 
         private Task<IValueBinder> BuildFromAttribute(FakeItemAttribute attr, Type parameterType)

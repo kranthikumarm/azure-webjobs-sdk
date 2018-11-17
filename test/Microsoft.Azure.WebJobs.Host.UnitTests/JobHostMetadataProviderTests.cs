@@ -4,9 +4,18 @@
 using System;
 using System.IO;
 using System.Reflection;
+using System.Threading;
+using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs.Description;
+using Microsoft.Azure.WebJobs.Host.Bindings;
 using Microsoft.Azure.WebJobs.Host.Config;
+using Microsoft.Azure.WebJobs.Host.Executors;
+using Microsoft.Azure.WebJobs.Host.Indexers;
+using Microsoft.Azure.WebJobs.Host.Protocols;
 using Microsoft.Azure.WebJobs.Host.TestCommon;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Options;
+using Moq;
 using Newtonsoft.Json.Linq;
 using Xunit;
 
@@ -15,24 +24,21 @@ namespace Microsoft.Azure.WebJobs.Host.UnitTests
     public class JobHostMetadataProviderTests
     {
         [Fact]
-        public void Test()
-        {
-            MyProg prog = new MyProg();
-            var activator = new FakeActivator();
-            activator.Add(prog);
-
-            JobHostConfiguration config = TestHelpers.NewConfig<MyProg>(activator);
-            
+        public async Task Test()
+        {          
             var ext = new TestExtension();
 
-            config.AddExtension(ext);
-
-            var host = new TestJobHost<MyProg>(config);
+            var host = new HostBuilder()
+                .ConfigureDefaultTestHost<MyProg>(b =>
+                {
+                    b.AddExtension(ext);
+                })
+                .Build();
             IJobHostMetadataProvider metadataProvider = host.CreateMetadataProvider();
             Assert.Equal(1, ext._counter);
 
             // Callable            
-            host.Call("Test");
+            await host.GetJobHost<MyProg>().CallAsync("Test");
             Assert.Equal(1, ext._counter);
 
             // Fact that we registered a Widget converter is enough to add the assembly 
@@ -48,132 +54,185 @@ namespace Microsoft.Azure.WebJobs.Host.UnitTests
             Assert.True(resolved);
             Assert.Same(asm, typeof(Widget).Assembly);
 
-            var attrType = metadataProvider.GetAttributeTypeFromName("Test");
-            Assert.Equal(typeof(TestAttribute), attrType);
+            // This requires the target attribute to be unique within the assembly. 
+            var attrType = metadataProvider.GetAttributeTypeFromName("Test9");
+            Assert.Equal(typeof(Test9Attribute), attrType);
 
             // JObject --> Attribute 
-            var attr = GetAttr<TestAttribute>(metadataProvider, new { Flag = "xyz" });
+            var attr = GetAttr<Test9Attribute>(metadataProvider, new { Flag = "xyz" });
             Assert.Equal("xyz", attr.Flag);
 
             // Getting default type. 
             var defaultType = metadataProvider.GetDefaultType(attr, FileAccess.Read, null);
             Assert.Equal(typeof(JObject), defaultType);
 
-            Assert.Throws<InvalidOperationException>(() => metadataProvider.GetDefaultType(attr, FileAccess.Write, typeof(object)));
+            // If we have no match for output, we'll try IAsyncCollector<string>
+            Assert.Equal(typeof(IAsyncCollector<string>), metadataProvider.GetDefaultType(attr, FileAccess.Write, typeof(object)));
         }
 
         static T GetAttr<T>(IJobHostMetadataProvider metadataProvider, object obj) where T : Attribute
         {
-            var attribute = metadataProvider.GetAttribute(typeof(T), JObject.FromObject(obj));            
-            return (T) attribute;
+            var attribute = metadataProvider.GetAttribute(typeof(T), JObject.FromObject(obj));
+            return (T)attribute;
         }
 
+        // This is a setup used by CosmoDb. 
         [Fact]
-        public void AttrBuilder()
+        public void DefaultTypeForOpenTypeCollector()
         {
-            JobHostConfiguration config = TestHelpers.NewConfig();
-            var host2 = new JobHost(config);
-            var metadataProvider = host2.CreateMetadataProvider();
+            var ext = new TestExtension2();
+            var host = new HostBuilder()
+                .ConfigureDefaultTestHost(b=>
+                {
+                    b.AddExtension(ext);
+                })
+                .Build();
 
-            // Blob 
-            var blobAttr = GetAttr<BlobAttribute>(metadataProvider, new { path = "x" } );
-            Assert.Equal("x", blobAttr.BlobPath);
-            Assert.Equal(null, blobAttr.Access);
+            IJobHostMetadataProvider metadataProvider = host.CreateMetadataProvider();
 
-            blobAttr = GetAttr<BlobAttribute>(metadataProvider, new { path = "x", direction="in" });
-            Assert.Equal("x", blobAttr.BlobPath);
-            Assert.Equal(FileAccess.Read, blobAttr.Access);
+            var attr = new Test9Attribute(null);
+            var type = metadataProvider.GetDefaultType(attr, FileAccess.Write, null);
 
-            blobAttr = GetAttr<BlobAttribute>(metadataProvider, new { Path = "x", Direction="out" });
-            Assert.Equal("x", blobAttr.BlobPath);
-            Assert.Equal(FileAccess.Write, blobAttr.Access);
+            // The collector handles Open type, which means it will first pull byte[]. 
+            Assert.Equal(typeof(IAsyncCollector<byte[]>), type);
+        }
 
-            blobAttr = GetAttr<BlobAttribute>(metadataProvider, new { path = "x", direction = "inout" });
-            Assert.Equal("x", blobAttr.BlobPath);
-            Assert.Equal(FileAccess.ReadWrite, blobAttr.Access);
-                        
-            blobAttr = GetAttr<BlobAttribute>(metadataProvider, 
-            new
+        // Setup similar to CosmoDb
+        public class TestExtension2 : IExtensionConfigProvider
+        {
+            public void Initialize(ExtensionConfigContext context)
             {
-                path = "x",
-                direction = "in",
-                connection = "cx1"
-            });               
-            Assert.Equal("x", blobAttr.BlobPath);
-            Assert.Equal(FileAccess.Read, blobAttr.Access);
-            Assert.Equal("cx1", blobAttr.Connection);
-
-            blobAttr = GetAttr<BlobAttribute>(metadataProvider,
-              new
-              {
-                  path = "x",
-                  direction = "in",
-                  connection = "" // empty, not null 
-              });
-            Assert.Equal("x", blobAttr.BlobPath);
-            Assert.Equal(FileAccess.Read, blobAttr.Access);
-            Assert.Equal("", blobAttr.Connection); // empty is passed straight through. 
-
-            var blobTriggerAttr = GetAttr<BlobTriggerAttribute>(metadataProvider, new { path = "x" });
-            Assert.Equal("x", blobTriggerAttr.BlobPath);
-
-            // Queue 
-            var queueAttr = GetAttr<QueueAttribute>(metadataProvider, new { QueueName = "q1" });
-            Assert.Equal("q1", queueAttr.QueueName);
-
-            var queueTriggerAttr = GetAttr<QueueTriggerAttribute>(metadataProvider, new { QueueName = "q1" });
-            Assert.Equal("q1", queueTriggerAttr.QueueName);
-            
-            // Table
-            var tableAttr = GetAttr<TableAttribute>(metadataProvider, new { TableName = "t1" });
-            Assert.Equal("t1", tableAttr.TableName);
-
-            tableAttr = GetAttr<TableAttribute>(metadataProvider, new { TableName = "t1", partitionKey ="pk", Filter="f1" });
-            Assert.Equal("t1", tableAttr.TableName);
-            Assert.Equal("pk", tableAttr.PartitionKey);
-            Assert.Equal(null, tableAttr.RowKey);
-            Assert.Equal("f1", tableAttr.Filter);
+                var ignored = typeof(object); // not used 
+                context.AddBindingRule<Test9Attribute>().BindToCollector<OpenType>(ignored);
+            }
         }
 
+        // Verify for a Jobject-only collector. 
         [Fact]
-        public void DefaultTypeForTable()
+        public void DefaultTypeForJObjectCollector()
         {
-            JobHostConfiguration config = TestHelpers.NewConfig();
-            var host2 = new JobHost(config);
-            var metadataProvider = host2.CreateMetadataProvider();
+            var ext = new TestExtension3();
 
-            var t1 = metadataProvider.GetDefaultType(new TableAttribute("table1"), FileAccess.Read, null);
-            Assert.Equal(typeof(JArray), t1);
+            var host = new HostBuilder()
+                .ConfigureDefaultTestHost(b =>
+                {
+                    b.AddExtension(ext);
+                })
+                .Build();
 
-            var t2 = metadataProvider.GetDefaultType(new TableAttribute("table1", "pk", "rk"), FileAccess.Read, null);
-            Assert.Equal(typeof(JObject), t2);
+            IJobHostMetadataProvider metadataProvider = host.CreateMetadataProvider();
 
-            var t3 = metadataProvider.GetDefaultType(new TableAttribute("table1"), FileAccess.Write, null);
-            Assert.Equal(typeof(IAsyncCollector<JObject>), t3);
+            var attr = new Test9Attribute(null);
+            var type = metadataProvider.GetDefaultType(attr, FileAccess.Write, null);
+
+            // Explicitly should be Jobject since that's all the collector is registered as.
+            Assert.Equal(typeof(IAsyncCollector<JObject>), type);
+        }
+
+        public class TestExtension3 : IExtensionConfigProvider
+        {
+            public void Initialize(ExtensionConfigContext context)
+            {
+                context.AddBindingRule<Test9Attribute>().
+                    BindToCollector<JObject>(attr => (IAsyncCollector<JObject>)null);
+            }
         }
 
 
         [Fact]
-        public void DefaultTypeForQueue()
+        public void DefaultTypeForTrigger()
         {
-            JobHostConfiguration config = TestHelpers.NewConfig();
-            var host2 = new JobHost(config);
-            var metadataProvider = host2.CreateMetadataProvider();
+            var ext = new JArrayTriggerExtension();
+            var host = new HostBuilder()
+                 .ConfigureDefaultTestHost(b =>
+                 {
+                     b.AddExtension(ext);
+                 })
+                 .ConfigureTypeLocator() // empty 
+                 .Build();
 
-            var t1 = metadataProvider.GetDefaultType(new QueueAttribute("q"), FileAccess.Read, typeof(byte[]));
-            Assert.Equal(typeof(byte[]), t1);
+            IJobHostMetadataProvider metadataProvider = host.CreateMetadataProvider();
 
-            var t2 = metadataProvider.GetDefaultType(new QueueAttribute("q"), FileAccess.Read, null);
-            Assert.Equal(typeof(string), t2);
-                        
-            var t3 = metadataProvider.GetDefaultType(new QueueAttribute("q"), FileAccess.Write, null);
-            Assert.Equal(typeof(IAsyncCollector<byte[]>), t3);
+            var attr = new Test9Attribute(null);
+            var type = metadataProvider.GetDefaultType(attr, FileAccess.Read, null);
+
+            Assert.Equal(typeof(JArray), type);
         }
 
+        public class JArrayTriggerExtension : IExtensionConfigProvider
+        {
+            public void Initialize(ExtensionConfigContext context)
+            {
+                var rule = context.AddBindingRule<Test9Attribute>();
+                rule.BindToTrigger<string>();
+                rule.AddConverter<string, JArray>(input => (JArray)null);
+            }
+        }
+
+        [Fact]
+        public void DefaultTypeForOpenTypeTrigger()
+        {
+            var ext = new OpenTypeTriggerExtension();
+            var host = new HostBuilder()
+                 .ConfigureDefaultTestHost(b =>
+                 {
+                     b.AddExtension(ext);
+                 })
+                 .ConfigureTypeLocator() // empty 
+                 .Build();
+            IJobHostMetadataProvider metadataProvider = host.CreateMetadataProvider();
+
+            var attr = new Test9Attribute(null);
+            var type = metadataProvider.GetDefaultType(attr, FileAccess.Write, null);
+
+            // The trigger handles Open type, which means it will first pull byte[]. 
+            Assert.Equal(typeof(byte[]), type);
+        }
+
+        public class OpenTypeTriggerExtension : IExtensionConfigProvider
+        {
+            public void Initialize(ExtensionConfigContext context)
+            {
+                var rule = context.AddBindingRule<Test9Attribute>();
+                rule.BindToTrigger<string>();
+                rule.AddOpenConverter<string, OpenType>((a, b, c) => null);
+            }
+        }
+
+        [Fact]
+        public void GetFunctionMetadata()
+        {
+            var mockFunctionIndexProvider = new Mock<IFunctionIndexProvider>();
+
+            var functionDescriptor = new FunctionDescriptor()
+            {
+                IsDisabled = true
+            };
+            var mockFunctionIndex = new Mock<IFunctionIndex>();
+            mockFunctionIndex.Setup(i => i.LookupByName("testMethod")).Returns(new FunctionDefinition(functionDescriptor, null, null));
+            var token = new CancellationToken();
+            mockFunctionIndexProvider.Setup(p => p.GetAsync(token)).Returns(Task.FromResult(mockFunctionIndex.Object));
+
+            Func<IFunctionIndexProvider> getter = (() =>
+            {
+                return mockFunctionIndexProvider.Object;
+            });
+
+            IJobHostMetadataProvider provider = new JobHostMetadataProvider(mockFunctionIndexProvider.Object, null, null, null);
+
+            var functionMetadata = provider.GetFunctionMetadata("testNotExists");
+            Assert.Equal(functionMetadata, null);
+
+            functionMetadata = provider.GetFunctionMetadata("testMethod");
+            Assert.Equal(functionMetadata.IsDisabled, true);
+        }
+
+        // Give this a unique name within the assembly so that the name --> type 
+        // reverse lookup can be unambiguous. 
         [Binding]
-        public class TestAttribute : Attribute
+        public class Test9Attribute : Attribute
         {
-            public TestAttribute(string flag)
+            public Test9Attribute(string flag)
             {
                 this.Flag = flag;
             }
@@ -185,20 +244,20 @@ namespace Microsoft.Azure.WebJobs.Host.UnitTests
             public string Value;
         }
 
-        public class TestExtension : IExtensionConfigProvider            
+        public class TestExtension : IExtensionConfigProvider
         {
-            public int _counter; 
+            public int _counter;
 
             public void Initialize(ExtensionConfigContext context)
             {
                 _counter++;
-                context.AddBindingRule<TestAttribute>().
+                context.AddBindingRule<Test9Attribute>().
                     BindToInput<Widget>(Builder);
 
-                context.AddConverter<Widget, JObject>(widget => JObject.FromObject(widget));                
+                context.AddConverter<Widget, JObject>(widget => JObject.FromObject(widget));
             }
 
-            Widget Builder(TestAttribute input)
+            Widget Builder(Test9Attribute input)
             {
                 return new Widget { Value = input.Flag };
             }
@@ -207,7 +266,7 @@ namespace Microsoft.Azure.WebJobs.Host.UnitTests
         public class MyProg
         {
             public string _value;
-            public void Test([Test("f1")] Widget w)
+            public void Test([Test9("f1")] Widget w)
             {
                 _value = w.Value;
             }

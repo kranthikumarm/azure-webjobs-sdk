@@ -3,16 +3,14 @@
 
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.Linq;
 using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
-using Microsoft.Azure.WebJobs.Host.Executors;
 using Microsoft.Azure.WebJobs.Host.Queues;
 using Microsoft.Azure.WebJobs.Host.TestCommon;
-using Microsoft.Azure.WebJobs.Host.Timers;
-using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 using Microsoft.WindowsAzure.Storage;
 using Microsoft.WindowsAzure.Storage.Blob;
 using Microsoft.WindowsAzure.Storage.Queue;
@@ -76,14 +74,18 @@ namespace Microsoft.Azure.WebJobs.Host.EndToEndTests
         /// - blob name pattern binding
         /// </summary>
         public static void BlobToQueue(
-            [BlobTrigger(ContainerName + @"/{name}")] CustomObject input,
+            [BlobTrigger(ContainerName + @"/{name}")] string input,
             string name,
             [Queue(TestQueueNameEtag)] out CustomObject output)
         {
+            // TODO: Use CustomObject as param when POCO blob supported:
+            //       https://github.com/Azure/azure-webjobs-sdk/issues/995
+            var inputObject = JsonConvert.DeserializeObject<CustomObject>(input);
+
             CustomObject result = new CustomObject()
             {
-                Text = input.Text + " " + name,
-                Number = input.Number + 1
+                Text = inputObject.Text + " " + name,
+                Number = inputObject.Number + 1
             };
 
             output = result;
@@ -205,15 +207,16 @@ namespace Microsoft.Azure.WebJobs.Host.EndToEndTests
             // Reinitialize the name resolver to avoid conflicts
             _resolver = new RandomNameResolver();
 
-            JobHostConfiguration hostConfig = new JobHostConfiguration()
-            {
-                NameResolver = _resolver,
-                TypeLocator = new FakeTypeLocator(
-                    this.GetType(),
-                    typeof(BlobToCustomObjectBinder))
-            };
-
-            hostConfig.AddService<IWebJobsExceptionHandler>(new TestExceptionHandler());
+            IHost host = new HostBuilder()
+                .ConfigureDefaultTestHost<AzureStorageEndToEndTests>(b =>
+                {
+                    b.AddAzureStorage();
+                })
+                .ConfigureServices(services =>
+                {
+                    services.AddSingleton<INameResolver>(_resolver);
+                })
+                .Build();
 
             // write test entities
             string testTableName = _resolver.ResolveInString(TableName);
@@ -253,28 +256,29 @@ namespace Microsoft.Azure.WebJobs.Host.EndToEndTests
                 Age = 28,
                 Location = "Tam O'Shanter"
             });
+
             await table.ExecuteBatchAsync(operation);
 
-            JobHost host = new JobHost(hostConfig);
-            var methodInfo = this.GetType().GetMethod("TableWithFilter", BindingFlags.Public | BindingFlags.Static);
+            JobHost jobHost = host.GetJobHost();
+            var methodInfo = GetType().GetMethod(nameof(TableWithFilter));
             var input = new Person { Age = 25, Location = "Seattle" };
             string json = JsonConvert.SerializeObject(input);
             var arguments = new { person = json };
-            await host.CallAsync(methodInfo, arguments);
+            await jobHost.CallAsync(methodInfo, arguments);
 
             // wait for test results to appear
             await TestHelpers.Await(() => testResult != null);
 
             JArray results = (JArray)testResult;
-            Assert.Equal(1, results.Count);
+            Assert.Single(results);
 
             input = new Person { Age = 25, Location = "Tam O'Shanter" };
             json = JsonConvert.SerializeObject(input);
             arguments = new { person = json };
-            await host.CallAsync(methodInfo, arguments);
+            await jobHost.CallAsync(methodInfo, arguments);
             await TestHelpers.Await(() => testResult != null);
             results = (JArray)testResult;
-            Assert.Equal(1, results.Count);
+            Assert.Single(results);
             Assert.Equal("Bill", (string)results[0]["Name"]);
         }
 
@@ -283,15 +287,16 @@ namespace Microsoft.Azure.WebJobs.Host.EndToEndTests
             // Reinitialize the name resolver to avoid conflicts
             _resolver = new RandomNameResolver();
 
-            JobHostConfiguration hostConfig = new JobHostConfiguration()
-            {
-                NameResolver = _resolver,
-                TypeLocator = new FakeTypeLocator(
-                    this.GetType(),
-                    typeof(BlobToCustomObjectBinder))
-            };
-
-            hostConfig.AddService<IWebJobsExceptionHandler>(new TestExceptionHandler());
+            IHost host = new HostBuilder()
+                .ConfigureDefaultTestHost<AzureStorageEndToEndTests>(b =>
+                {
+                    b.AddAzureStorage();
+                })
+                .ConfigureServices(services =>
+                {
+                    services.AddSingleton<INameResolver>(_resolver);
+                })
+                .Build();
 
             if (uploadBlobBeforeHostStart)
             {
@@ -300,11 +305,11 @@ namespace Microsoft.Azure.WebJobs.Host.EndToEndTests
             }
 
             // The jobs host is started
-            JobHost host = new JobHost(hostConfig);
+            JobHost jobHost = host.GetJobHost();
 
             _functionChainWaitHandle = new ManualResetEvent(initialState: false);
 
-            host.Start();
+            await host.StartAsync();
 
             if (!uploadBlobBeforeHostStart)
             {
@@ -312,12 +317,13 @@ namespace Microsoft.Azure.WebJobs.Host.EndToEndTests
                 await UploadTestObject();
             }
 
-            bool signaled = _functionChainWaitHandle.WaitOne(15 * 1000);
+            var waitTime = TimeSpan.FromSeconds(15);
+            bool signaled = _functionChainWaitHandle.WaitOne(waitTime);
 
             // Stop the host and wait for it to finish
-            host.Stop();
+            await host.StopAsync();
 
-            Assert.True(signaled);
+            Assert.True(signaled, $"[{DateTime.UtcNow.ToString("HH:mm:ss.fff")}] Function chain did not complete in {waitTime}. Logs:{Environment.NewLine}{host.GetTestLoggerProvider().GetLogString()}");
 
             // Verify
             await VerifyTableResultsAsync();
@@ -335,30 +341,22 @@ namespace Microsoft.Azure.WebJobs.Host.EndToEndTests
 
             // Reinitialize the name resolver to avoid conflicts
             _resolver = new RandomNameResolver();
+            IHost host = new HostBuilder()
+                .ConfigureDefaultTestHost<AzureStorageEndToEndTests>(b =>
+                {
+                    b.AddAzureStorage();
+                })
+                .ConfigureServices(services =>
+                {
+                    // use a custom processor so we can grab the Id and PopReceipt
+                    services.AddSingleton<IQueueProcessorFactory>(new TestQueueProcessorFactory());
+                    services.AddSingleton<INameResolver>(_resolver);
+                })
+                .Build();
 
-            JobHostConfiguration hostConfig = new JobHostConfiguration()
-            {
-                NameResolver = _resolver,
-                TypeLocator = new FakeTypeLocator(
-                    this.GetType(),
-                    typeof(BlobToCustomObjectBinder))
-            };
-
-            hostConfig.AddService<IWebJobsExceptionHandler>(new TestExceptionHandler());
-
-            // use a custom processor so we can grab the Id and PopReceipt
-            hostConfig.Queues.QueueProcessorFactory = new TestQueueProcessorFactory();
-
-            var tracer = new TestTraceWriter(System.Diagnostics.TraceLevel.Verbose);
-            hostConfig.Tracing.Tracers.Add(tracer);
-
-            ILoggerFactory loggerFactory = new LoggerFactory();
-            TestLoggerProvider loggerProvider = new TestLoggerProvider();
-            loggerFactory.AddProvider(loggerProvider);
-            hostConfig.LoggerFactory = loggerFactory;
+            TestLoggerProvider loggerProvider = host.GetTestLoggerProvider();
 
             // The jobs host is started
-            JobHost host = new JobHost(hostConfig);
             host.Start();
 
             // use reflection to construct a bad message:
@@ -403,10 +401,11 @@ namespace Microsoft.Azure.WebJobs.Host.EndToEndTests
                         Assert.Equal("MessageNotFound", ex.RequestInformation.ExtendedErrorInformation.ErrorCode);
                     }
                 }
+                var logs = loggerProvider.GetAllLogMessages();
                 return done;
             });
 
-            host.Stop();
+            await host.StopAsync();
 
             // find the raw string to compare it to the original
             Assert.NotNull(poisonMessage);
@@ -418,12 +417,8 @@ namespace Microsoft.Azure.WebJobs.Host.EndToEndTests
             Assert.Equal(1, _badMessage1Calls);
             Assert.Equal(0, _badMessage2Calls);
 
-            // make sure the exception is being properly logged
-            var errors = tracer.Traces.Where(t => t.Level == System.Diagnostics.TraceLevel.Error);
-            Assert.True(errors.All(t => t.Exception.InnerException.InnerException is FormatException));
-
             // Validate Logger
-            var loggerErrors = loggerProvider.GetAllLogMessages().Where(l => l.Level == Extensions.Logging.LogLevel.Error);
+            var loggerErrors = loggerProvider.GetAllLogMessages().Where(l => l.Level == Microsoft.Extensions.Logging.LogLevel.Error);
             Assert.True(loggerErrors.All(t => t.Exception.InnerException.InnerException is FormatException));
         }
 
@@ -538,8 +533,15 @@ namespace Microsoft.Azure.WebJobs.Host.EndToEndTests
         {
             public TestFixture()
             {
-                JobHostConfiguration config = new JobHostConfiguration();
-                StorageAccount = CloudStorageAccount.Parse(config.StorageConnectionString);
+                IHost host = new HostBuilder()
+                    .ConfigureDefaultTestHost<TestFixture>(b =>
+                    {
+                        b.AddAzureStorage();
+                    })
+                    .Build();
+
+                var provider = host.Services.GetService<StorageAccountProvider>();
+                StorageAccount = provider.GetHost().SdkObject;
             }
 
             public CloudStorageAccount StorageAccount

@@ -7,7 +7,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs.Host.Bindings;
 using Microsoft.Azure.WebJobs.Host.Config;
-using Microsoft.Azure.WebJobs.Host.Triggers;
+using Newtonsoft.Json.Linq;
 using Xunit;
 
 namespace Microsoft.Azure.WebJobs.Host.UnitTests
@@ -15,6 +15,15 @@ namespace Microsoft.Azure.WebJobs.Host.UnitTests
     // For sending fake queue messages. 
     public class FakeQueueClient : IExtensionConfigProvider, IConverter<FakeQueueAttribute, FakeQueueClient>
     {
+        private readonly INameResolver _nameResolver;
+        private readonly IConverterManager _converterManager;
+
+        public FakeQueueClient(INameResolver nameResolver, IConverterManager converterManager)
+        {
+            _nameResolver = nameResolver;
+            _converterManager = converterManager;
+        }
+
         public List<FakeQueueData> _items = new List<FakeQueueData>();
 
         public Dictionary<string, List<FakeQueueData>> _prefixedItems = new Dictionary<string, List<FakeQueueData>>();
@@ -32,39 +41,42 @@ namespace Microsoft.Azure.WebJobs.Host.UnitTests
         }
 
         // Test hook for customizing converters
-        public Action<IConverterManager> SetConverters
+        public Action<ExtensionConfigContext> SetConverters
         {
             get; set;
         }
 
         void IExtensionConfigProvider.Initialize(ExtensionConfigContext context)
         {
-            INameResolver nameResolver = context.Config.GetService<INameResolver>();
-            IConverterManager cm = context.Config.GetService<IConverterManager>();
-            cm.AddConverter<string, FakeQueueData>(x => new FakeQueueData { Message = x });
+            var rule = context.AddBindingRule<FakeQueueAttribute>();
 
-            if (this.SetConverters != null)
-            {
-                this.SetConverters(cm);
-            }
+            context.AddConverter<string, FakeQueueData>(x => new FakeQueueData { Message = x });
+            context.AddConverter<FakeQueueData, string>(msg => msg.Message);
+            context.AddConverter<OtherFakeQueueData, FakeQueueData>(OtherFakeQueueData.ToEvent);
 
-            cm.AddConverter<FakeQueueData, string>(msg => msg.Message);
-            cm.AddConverter<OtherFakeQueueData, FakeQueueData>(OtherFakeQueueData.ToEvent);
+            rule.AddOpenConverter<OpenType.Poco, FakeQueueData>(ConvertPocoToFakeQueueMessage);
 
-            IExtensionRegistry extensions = context.Config.GetService<IExtensionRegistry>();
-
-            var bf = new BindingFactory(nameResolver, cm);
+            SetConverters?.Invoke(context);
 
             // Binds [FakeQueue] --> IAsyncCollector<FakeQueueData>
-            var ruleOutput = bf.BindToCollector<FakeQueueAttribute, FakeQueueData>(BuildFromAttr);
+            rule.BindToCollector<FakeQueueData>(BuildFromAttr);
 
             // Binds [FakeQueue] --> FakeQueueClient
-            var ruleClient = bf.BindToInput<FakeQueueAttribute, FakeQueueClient>(this);
+            rule.BindToInput<FakeQueueClient>(this);
 
-            extensions.RegisterBindingRules<FakeQueueAttribute>(ruleOutput, ruleClient);
+            var triggerBindingProvider = new FakeQueueTriggerBindingProvider(this, _converterManager);
+            context.AddBindingRule<FakeQueueTriggerAttribute>()
+                .BindToTrigger(triggerBindingProvider);
+        }
 
-            var triggerBindingProvider = new FakeQueueTriggerBindingProvider(this, cm);
-            extensions.RegisterExtension<ITriggerBindingProvider>(triggerBindingProvider);
+        private Task<object> ConvertFakeQueueMessageToPoco(object src, Attribute attribute, ValueBindingContext context)
+        {
+            throw new NotImplementedException();
+        }
+
+        private Task<object> ConvertPocoToFakeQueueMessage(object arg, Attribute attrResolved, ValueBindingContext context)
+        {
+            return Task.FromResult<object>(new FakeQueueData { Message = JObject.FromObject(arg).ToString() });
         }
 
         FakeQueueClient IConverter<FakeQueueAttribute, FakeQueueClient>.Convert(FakeQueueAttribute attr)

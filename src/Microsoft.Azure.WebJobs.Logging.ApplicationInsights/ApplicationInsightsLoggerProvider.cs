@@ -8,21 +8,18 @@ using Microsoft.Extensions.Logging;
 
 namespace Microsoft.Azure.WebJobs.Logging.ApplicationInsights
 {
-    internal class ApplicationInsightsLoggerProvider : ILoggerProvider
+
+    [ProviderAlias(Alias)]
+    public class ApplicationInsightsLoggerProvider : ILoggerProvider
     {
+        internal const string Alias = "ApplicationInsights";
+
         private readonly TelemetryClient _client;
-        private ITelemetryClientFactory _clientFactory;
         private bool _disposed;
 
-        public ApplicationInsightsLoggerProvider(ITelemetryClientFactory clientFactory)
+        public ApplicationInsightsLoggerProvider(TelemetryClient client)
         {
-            if (clientFactory == null)
-            {
-                throw new ArgumentNullException(nameof(clientFactory));
-            }
-
-            _clientFactory = clientFactory;
-            _client = _clientFactory.Create();
+            _client = client ?? throw new ArgumentNullException(nameof(client));
         }
 
         public ILogger CreateLogger(string categoryName) => new ApplicationInsightsLogger(_client, categoryName);
@@ -46,8 +43,6 @@ namespace Microsoft.Azure.WebJobs.Logging.ApplicationInsights
                         // Ignore failures on dispose
                     }
                 }
-
-                _clientFactory.Dispose();
 
                 _disposed = true;
             }

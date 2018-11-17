@@ -19,8 +19,7 @@ namespace Microsoft.Azure.WebJobs.Logging
     {
         // Logs from AddAsync() are batched up. They can be explicitly flushed via FlushAsync() and 
         // they get autotmatically flushed at Interval. 
-        // Calling AddAsync() will startup the background flusher. Calling FlushAsync() explicitly will disable it. 
-        private static TimeSpan _flushInterval = TimeSpan.FromSeconds(45);
+        // Calling AddAsync() will startup the background flusher. Calling FlushAsync() explicitly will disable it.
         private CancellationTokenSource _cancelBackgroundFlusher = null;
         private Task _backgroundFlusherTask = null;
 
@@ -50,6 +49,9 @@ namespace Microsoft.Azure.WebJobs.Logging
         private CloudTableInstanceCountLogger _instanceLogger;
 
         private Action<Exception> _onException;
+
+        public int MaxBufferedEntryCount { get; set; } = 10000;
+        public TimeSpan FlushInterval { get; set; } = TimeSpan.FromSeconds(45);
 
         public LogWriter(string hostName, string machineName, ILogTableProvider logTableProvider, Action<Exception> onException = null)
         {
@@ -81,15 +83,17 @@ namespace Microsoft.Azure.WebJobs.Logging
             {
                 try
                 {
-                    await Task.Delay(_flushInterval, cancellationToken);
+                    await Task.Delay(FlushInterval, cancellationToken);
+                    await this.FlushCoreAsync();
                 }
-                catch (OperationCanceledException)
+                catch
                 {
-                    // Don't return yet. One last chance to flush 
-                    return;
+                    lock (_lock)
+                    {
+                        _backgroundFlusherTask = null;
+                        return;
+                    }
                 }
-
-                await this.FlushCoreAsync();
             }
         }
 
@@ -152,6 +156,15 @@ namespace Microsoft.Azure.WebJobs.Logging
             // Both Start and Completed log here. Completed will overwrite a Start entry. 
             lock (_lock)
             {
+                // Permanent failures when flushing to storage can result in many log entries being buffered.
+                // This basically becomes a memory leak. Mitigate by enforcing a max.
+                if (_activeFuncs.Count >= MaxBufferedEntryCount || _completedFunctions.Count >= MaxBufferedEntryCount)
+                {
+                    _onException?.Invoke(new Exception($"The limit on the number of buffered log entries was reached. A total of '{MaxBufferedEntryCount}' log entries were dropped."));
+                    _activeFuncs.Clear();
+                    _completedFunctions.Clear();
+                }
+
                 _activeFuncs[item.FunctionInstanceId] = item;
             }
 
@@ -174,7 +187,10 @@ namespace Microsoft.Azure.WebJobs.Logging
                 _container.Decrement(item.FunctionInstanceId);
                 _instanceLogger.Decrement(item.FunctionInstanceId);
 
-                _completedFunctions.Add(item.FunctionInstanceId);
+                lock (_lock)
+                {
+                    _completedFunctions.Add(item.FunctionInstanceId);
+                }
             }
             else
             {
@@ -234,6 +250,10 @@ namespace Microsoft.Azure.WebJobs.Logging
                     }
                 }
 
+                // https://github.com/Azure/azure-webjobs-sdk/issues/1761
+                // Just making a note while I'm in this code fixing something else. 
+                // It looks like this will drop data if there is any type of error when communicating with storage. 
+                // Other code paths drop the data after successfully writing to storage
                 foreach (var val in flush)
                 {
                     _timespan.Remove(val.RowKey);
@@ -246,51 +266,46 @@ namespace Microsoft.Azure.WebJobs.Logging
             }
         }
 
-
-        private FunctionInstanceLogItem[] Update()
-        {
-            FunctionInstanceLogItem[] items;
-            lock (_lock)
-            {
-                items = _activeFuncs.Values.ToArray();
-            }
-            foreach (var item in items)
-            {
-                item.Refresh(_flushInterval);
-            }
-            return items;
-        }
-
         // Could flush on a timer. 
         private async Task FlushIntancesAsync()
         {
+            FunctionInstanceLogItem[] itemsSnapshot;
+            Guid[] completedSnapshot;
+            FunctionDefinitionEntity[] functionDefinitionSnapshot;
+
+            // Get snapshots while under the lock. 
+            lock (_lock)
+            {
+                itemsSnapshot = _activeFuncs.Values.ToArray();
+                completedSnapshot = _completedFunctions.ToArray();
+                functionDefinitionSnapshot = _funcDefs.ToArray();
+                _funcDefs.Clear();
+            }
+
             // Before writing, give items a chance to refresh 
-            var itemsSnapshot = Update();
+            foreach (var item in itemsSnapshot)
+            {
+                item.Refresh(FlushInterval);
+            }
 
             // Write entries
             var instances = itemsSnapshot.Select(item => InstanceTableEntity.New(item));
             var recentInvokes = itemsSnapshot.Select(item => RecentPerFuncEntity.New(_machineName, item));
 
-            FunctionDefinitionEntity[] functionDefinitions;
-
-            lock (_lock)
-            {
-                functionDefinitions = _funcDefs.ToArray();
-                _funcDefs.Clear();
-            }
+             
             Task t1 = WriteBatchAsync(instances);
             Task t2 = WriteBatchAsync(recentInvokes);
-            Task t3 = WriteBatchAsync(functionDefinitions);
+            Task t3 = WriteBatchAsync(functionDefinitionSnapshot);
             await Task.WhenAll(t1, t2, t3);
 
             // After we write to table, remove all completed functions. 
             lock (_lock)
             {
-                foreach (var completedId in _completedFunctions)
+                foreach (var completedId in completedSnapshot)
                 {
                     _activeFuncs.Remove(completedId);
+                    _completedFunctions.Remove(completedId);
                 }
-                _completedFunctions.Clear();
             }
         }
 

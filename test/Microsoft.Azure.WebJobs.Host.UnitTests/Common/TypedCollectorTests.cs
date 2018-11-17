@@ -1,16 +1,18 @@
 ﻿// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
-using Microsoft.Azure.WebJobs.Host.Bindings;
-using Microsoft.Azure.WebJobs.Host.Config;
+using System;
 using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
-using System;
-using Xunit;
+using Microsoft.Azure.WebJobs.Host.Bindings;
+using Microsoft.Azure.WebJobs.Host.Config;
 using Microsoft.Azure.WebJobs.Host.TestCommon;
-using Newtonsoft.Json;
 using Microsoft.Azure.WebJobs.Host.UnitTests.Indexers;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Newtonsoft.Json;
+using Xunit;
 
 namespace Microsoft.Azure.WebJobs.Host.UnitTests
 {
@@ -47,7 +49,7 @@ namespace Microsoft.Azure.WebJobs.Host.UnitTests
                 q3 = new SpecialData[] {
                      new SpecialData { Message = "q3a" },
                      new SpecialData { Message = "q3b" }
-                };    
+                };
             }
 
             public static void ObjectArray(
@@ -62,30 +64,43 @@ namespace Microsoft.Azure.WebJobs.Host.UnitTests
 
 
         [Fact]
-        public void TestObjectArray()
+        public async Task TestObjectArray()
         {
             var client = new FakeQueueTypedClient();
-            var nr = new DictNameResolver();
+            var nr = new FakeNameResolver();
             nr.Add("appsetting1", "val1");
-            var host = TestHelpers.NewJobHost<Functions>(client, nr);
 
-            host.Call("ObjectArray");
+            var host = new HostBuilder()
+                .ConfigureDefaultTestHost<Functions>(b =>
+                {
+                    b.AddExtension(client);
+                })
+                .ConfigureServices(s => s.AddSingleton<INameResolver>(nr))
+                .Build();
+
+            await host.GetJobHost().CallAsync(typeof(Functions).GetMethod(nameof(Functions.ObjectArray)));
 
             Assert.Equal(2, client._items.Count);
             Assert_IsSpecialData("1", client._items[0]);
             Assert_IsSpecialData("2", client._items[1]);
             client._items.Clear();
-        }            
-        
+        }
+
         [Fact]
-        public void Test()
+        public async Task Test()
         {
             var client = new FakeQueueTypedClient();
-            var nr = new DictNameResolver();
+            var nr = new FakeNameResolver();
             nr.Add("appsetting1", "val1");
-            var host = TestHelpers.NewJobHost<Functions>(client, nr);
+            var host = new HostBuilder()
+                .ConfigureDefaultTestHost<Functions>(b =>
+                {
+                    b.AddExtension(client);
+                })
+                .ConfigureServices(s => s.AddSingleton<INameResolver>(nr))
+                .Build();
 
-            host.Call("T1");
+            await host.GetJobHost().CallAsync(typeof(Functions).GetMethod(nameof(Functions.T1)));
 
             Assert.Equal(6, client._items.Count);
 
@@ -115,7 +130,7 @@ namespace Microsoft.Azure.WebJobs.Host.UnitTests
         // Track items that are queued. 
         public List<object> _items;
         public string _prefix; // from attribute, to test attribute automatic resolution. 
-                
+
         public FakeQueueTypedClient()
         {
             _items = new List<object>();
@@ -129,11 +144,8 @@ namespace Microsoft.Azure.WebJobs.Host.UnitTests
         void IExtensionConfigProvider.Initialize(ExtensionConfigContext context)
         {
             // Don't add any converters. 
-            IExtensionRegistry extensions = context.Config.GetService<IExtensionRegistry>();
-            var bf = context.Config.BindingFactory;
-
-            var ruleOutput = bf.BindToCollector<FakeQueueAttribute, OpenType>(typeof(Builder<>), this);
-            extensions.RegisterBindingRules<FakeQueueAttribute>(ruleOutput);
+            var rule = context.AddBindingRule<FakeQueueAttribute>();
+            rule.BindToCollector<OpenType>(typeof(Builder<>), this);
         }
 
         public class Builder<T> : IConverter<FakeQueueAttribute, IAsyncCollector<T>>
@@ -178,7 +190,7 @@ namespace Microsoft.Azure.WebJobs.Host.UnitTests
 
             public Task FlushAsync(CancellationToken cancellationToken = default(CancellationToken))
             {
-                return Task.FromResult(0);          
+                return Task.FromResult(0);
             }
         }
     }

@@ -3,23 +3,24 @@
 
 using System;
 using System.IO;
-using Microsoft.Azure.WebJobs.Host.Config;
 using Microsoft.Azure.WebJobs.Description;
+using Microsoft.Azure.WebJobs.Host.Config;
+using Microsoft.Azure.WebJobs.Host.TestCommon;
+using Microsoft.Extensions.Configuration;
 using Xunit;
 
 namespace Microsoft.Azure.WebJobs.Host.UnitTests
 {
     public class ExtensionConfigContextTests
     {
+        private static readonly IConfiguration _config = new ConfigurationBuilder().Build();
+
         [Fact]
         public void BasicRules()
         {
-            var config = new JobHostConfiguration();
-            var ctx = new ExtensionConfigContext
-            {
-                Config = config
-            };
-
+            ConverterManager cm = new ConverterManager();
+            INameResolver nr = new FakeNameResolver();
+            var ctx = new ExtensionConfigContext(_config, nr, cm, null, null);
 
             // Simulates extension initialization scope.
             {
@@ -52,12 +53,8 @@ namespace Microsoft.Azure.WebJobs.Host.UnitTests
         [Fact]
         public void Converters()
         {
-            var config = new JobHostConfiguration();
-            var ctx = new ExtensionConfigContext
-            {
-                Config = config
-            };
-
+            ConverterManager cm = new ConverterManager();
+            var ctx = new ExtensionConfigContext(_config, null, cm, null, null);
 
             // Simulates extension initialization scope.
             {
@@ -66,16 +63,14 @@ namespace Microsoft.Azure.WebJobs.Host.UnitTests
             }
             ctx.ApplyRules();
 
-            var cm = config.ConverterManager;
-
             {
-                var generalConverter = cm.GetConverter<int, string, Attribute>();
+                var generalConverter = cm.GetSyncConverter<int, string, Attribute>();
                 var result = generalConverter(12, null, null);
                 Assert.Equal("general", result);
             }
 
             {
-                var specificConverter = cm.GetConverter<int, string, TestAttribute>();
+                var specificConverter = cm.GetSyncConverter<int, string, TestAttribute>();
                 var result = specificConverter(12, null, null);
                 Assert.Equal("specific", result);
             }
@@ -84,40 +79,30 @@ namespace Microsoft.Azure.WebJobs.Host.UnitTests
         [Fact]
         public void Error_IfMissingBindingAttribute()
         {
-            var config = new JobHostConfiguration();
-            var ctx = new ExtensionConfigContext
-            {
-                Config = config
-            };
-                      
+            var ctx = new ExtensionConfigContext(_config, null, null, null, null);
+
             // 'Attribute' 
             Assert.Throws<InvalidOperationException>(() => ctx.AddBindingRule<Attribute>());
         }
 
         [Fact]
-        public void Error_CallingAddBindingRule_Multiple_Times()
+        public void CallingAddBindingRule_Multiple_Times()
         {
-            var config = new JobHostConfiguration();
-            var ctx = new ExtensionConfigContext
-            {
-                Config = config
-            };
+            var ctx = new ExtensionConfigContext(_config, null, null, null, null);
 
             // First time is fine
-            ctx.AddBindingRule<TestAttribute>();
+            var rule1 = ctx.AddBindingRule<TestAttribute>();
 
-            // Second time on the same Attribute is an error. 
-            Assert.Throws<InvalidOperationException>(() => ctx.AddBindingRule<TestAttribute>());
+            // Second time on the same Attribute gives the same instance
+            var rule2 = ctx.AddBindingRule<TestAttribute>();
+
+            Assert.Same(rule1, rule2);
         }
 
         [Fact]
         public void ErrorOnDanglingWhen()
         {
-            var config = new JobHostConfiguration();
-            var ctx = new ExtensionConfigContext
-            {
-                Config = config
-            };
+            var ctx = new ExtensionConfigContext(_config, null, null, null, null);
 
             // Simulates extension initialization scope.
             {

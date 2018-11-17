@@ -7,6 +7,10 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs.Host.TestCommon;
+using Microsoft.Azure.WebJobs.Logging;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Xunit;
 
@@ -30,9 +34,11 @@ namespace Microsoft.Azure.WebJobs.Host.UnitTests.Executors
         [Fact]
         public async Task SuccessTest()
         {
-            var host = TestHelpers.NewJobHost<MyProg3>();
+            IHost host = new HostBuilder()
+                .ConfigureDefaultTestHost<MyProg3>()
+                .Build();
 
-            await host.CallAsync("MyProg3.Method2");
+            await host.GetJobHost<MyProg3>().CallAsync("MyProg3.Method2");
             var expected =
                 "[ctor][Pre-Instance][Pre_class][Pre_m1][Pre_m2]" +
                 "[body]" +
@@ -44,13 +50,15 @@ namespace Microsoft.Azure.WebJobs.Host.UnitTests.Executors
         // A B C Body* --> C' B' A'        
         [Fact]
         public async Task FailInBody()
-        {  
-            var host = TestHelpers.NewJobHost<MyProg3>();
+        {
+            IHost host = new HostBuilder()
+                .ConfigureDefaultTestHost<MyProg3>()
+                .Build();
 
             // Fail in body. Post-filters still execute since their corresponding Pre executed.
             _throwAtPhase = "body";
-                        
-            await CallExpectFailureAsync(host);
+
+            await CallExpectFailureAsync(host.GetJobHost<MyProg3>());
 
             var expected =
                 "[ctor][Pre-Instance][Pre_class][Pre_m1][Pre_m2]" +
@@ -65,14 +73,16 @@ namespace Microsoft.Azure.WebJobs.Host.UnitTests.Executors
         [Fact]
         public async Task FailInPreFilter()
         {
-            var host = TestHelpers.NewJobHost<MyProg3>();
+            IHost host = new HostBuilder()
+                .ConfigureDefaultTestHost<MyProg3>()
+                .Build();
 
             // Fail in pre-filter. 
             // Subsequent pre-filters (and body) don't run.
             // But any post filter (who's pre-filter succeeded) should still run.
             _throwAtPhase = "Pre_m1";
 
-            await CallExpectFailureAsync(host);
+            await CallExpectFailureAsync(host.GetJobHost<MyProg3>());
 
             var expected =
                 "[ctor][Pre-Instance][Pre_class][Pre_m1-Throw!]" +
@@ -86,13 +96,15 @@ namespace Microsoft.Azure.WebJobs.Host.UnitTests.Executors
         [Fact]
         public async Task FailInPostFilter()
         {
-            var host = TestHelpers.NewJobHost<MyProg3>();
+            IHost host = new HostBuilder()
+                .ConfigureDefaultTestHost<MyProg3>()
+                .Build();
 
             // Fail in post-filter! 
             // All post-filters should still run since their pre-filters ran. 
             _throwAtPhase = "Post_m1";
 
-            await CallExpectFailureAsync(host);
+            await CallExpectFailureAsync(host.GetJobHost<MyProg3>());
 
             var expected =
                 "[ctor][Pre-Instance][Pre_class][Pre_m1][Pre_m2]" +
@@ -107,15 +119,19 @@ namespace Microsoft.Azure.WebJobs.Host.UnitTests.Executors
         [Fact]
         public async Task DoubleFailure()
         {
-            var loggerProvider = new TestLoggerProvider();
-
             // create a host with some global filters
-            var host = TestHelpers.NewJobHost<MyProg3>(
-                new MyInvocationFilterAttribute("global"), new MyExceptionFilterAttribute("global"), loggerProvider);
+            IHost host = new HostBuilder()
+                .ConfigureDefaultTestHost<MyProg3>()
+                .ConfigureServices(services =>
+                {
+                    services.TryAddEnumerable(ServiceDescriptor.Singleton<IFunctionFilter>(new MyInvocationFilterAttribute("global")));
+                    services.TryAddEnumerable(ServiceDescriptor.Singleton<IFunctionFilter>(new MyExceptionFilterAttribute("global")));
+                })
+                .Build();
 
             _throwAtPhase = "body;Post_m1";
 
-            await CallExpectFailureAsync(host);
+            await CallExpectFailureAsync(host.GetJobHost<MyProg3>());
             var expected =
                 "[ctor][Pre-Instance][Pre_global][Pre_class][Pre_m1][Pre_m2]" +
                 "[body-Throw!]" +
@@ -124,8 +140,13 @@ namespace Microsoft.Azure.WebJobs.Host.UnitTests.Executors
 
             Assert.Equal(expected, TestLog.ToString());
 
-            var logger = loggerProvider.CreatedLoggers.Single(p => p.Category == "Host.Executor");
-            string logResult = string.Join("|", logger.LogMessages.Select(p => p.FormattedMessage));
+            var logger = host.GetTestLoggerProvider().CreatedLoggers.Single(p => p.Category == LogCategories.CreateFunctionCategory(nameof(MyProg3.Method2)));
+
+            // strip out the 4 messages written by the executor ("Executing", FunctionStartedEvent, "Executed", FunctionCompletedEvent)
+            string logResult = string.Join("|", logger.GetLogMessages()
+                .Where(p => p.EventId.Id == 0 && !p.FormattedMessage.StartsWith("Execut"))
+                .Select(p => p.FormattedMessage));
+
             Assert.Equal(
                 "Pre_global|Pre_class|Pre_m1|Pre_m2|" +
                 "Post_m2|Post_m1|Post_class|Post_global|" +
@@ -135,13 +156,15 @@ namespace Microsoft.Azure.WebJobs.Host.UnitTests.Executors
         [Fact]
         public async Task ActivationFailure()
         {
-            var host = TestHelpers.NewJobHost<MyProg3>();
+            IHost host = new HostBuilder()
+              .ConfigureDefaultTestHost<MyProg3>()
+              .Build();
 
             _throwAtPhase = "ctor";
 
             // since instance creation fails, we don't expect the instance filter
             // to run
-            await CallExpectFailureAsync(host);
+            await CallExpectFailureAsync(host.GetJobHost<MyProg3>());
             var expected = "[ctor-Throw!][ExceptionFilter_class][ExceptionFilter_method]";
 
             Assert.Equal(expected, TestLog.ToString());
@@ -151,12 +174,18 @@ namespace Microsoft.Azure.WebJobs.Host.UnitTests.Executors
         public async Task ExceptionFilterFailure()
         {
             // create a host with some global filters
-            var host = TestHelpers.NewJobHost<MyProg3>(
-                new MyInvocationFilterAttribute("global"), new MyExceptionFilterAttribute("global"));
+            IHost host = new HostBuilder()
+               .ConfigureDefaultTestHost<MyProg3>()
+               .ConfigureServices(services =>
+               {
+                   services.TryAddEnumerable(ServiceDescriptor.Singleton<IFunctionFilter>(new MyInvocationFilterAttribute("global")));
+                   services.TryAddEnumerable(ServiceDescriptor.Singleton<IFunctionFilter>(new MyExceptionFilterAttribute("global")));
+               })
+               .Build();
 
             _throwAtPhase = "body;ExceptionFilter_global";
 
-            await CallExpectFailureAsync(host);
+            await CallExpectFailureAsync(host.GetJobHost<MyProg3>());
             var expected =
                 "[ctor][Pre-Instance][Pre_global][Pre_class][Pre_m1][Pre_m2]" +
                 "[body-Throw!]" +
@@ -170,19 +199,21 @@ namespace Microsoft.Azure.WebJobs.Host.UnitTests.Executors
         [Fact]
         public async Task ClassFilterAndMethodShareInstance()
         {
-            var host = TestHelpers.NewJobHost<MyProgInstanceFilter>();
+            IHost host = new HostBuilder()
+               .ConfigureDefaultTestHost<MyProgInstanceFilter>()
+               .Build();
 
             // Verify that:
             // - each instance calls [New] and [Dispose] 
             // - [Dispose] on the class comes after filters. 
-
-            await host.CallAsync(nameof(MyProgInstanceFilter.Method));
+            var jobHost = host.GetJobHost<MyProgInstanceFilter>();
+            await jobHost.CallAsync(nameof(MyProgInstanceFilter.Method));
             var fullPipeline = "[New][Pre-Instance][body][Post-Instance][Dispose]";
             Assert.Equal(fullPipeline, TestLog.ToString());
 
             // 2nd call invokes JobActivator again, which will new up a new instance 
             // So we should see another [New] tag in the log. 
-            await host.CallAsync(nameof(MyProgInstanceFilter.Method));
+            await jobHost.CallAsync(nameof(MyProgInstanceFilter.Method));
             Assert.Equal(fullPipeline + fullPipeline, TestLog.ToString());
         }
 
@@ -193,13 +224,17 @@ namespace Microsoft.Azure.WebJobs.Host.UnitTests.Executors
         {
             MyInvocationFilterAttribute.Counter = 0;
 
-            var host = TestHelpers.NewJobHost<MyProgWithClassFilter>();
-                        
-            await host.CallAsync(nameof(MyProgWithClassFilter.Method));
+            IHost host = new HostBuilder()
+                .ConfigureDefaultTestHost<MyProgWithClassFilter>()
+                .Build();
+
+            var jobHost = host.GetJobHost<MyProgWithClassFilter>();
+
+            await jobHost.CallAsync(nameof(MyProgWithClassFilter.Method));
             Assert.Equal(1, MyInvocationFilterAttribute.Counter);
 
-            await host.CallAsync(nameof(MyProgWithClassFilter.Method));
-            await host.CallAsync(nameof(MyProgWithClassFilter.Method));
+            await jobHost.CallAsync(nameof(MyProgWithClassFilter.Method));
+            await jobHost.CallAsync(nameof(MyProgWithClassFilter.Method));
 
             Assert.Equal(1, MyInvocationFilterAttribute.Counter);
         }
@@ -211,13 +246,17 @@ namespace Microsoft.Azure.WebJobs.Host.UnitTests.Executors
         {
             MyInvocationFilterAttribute.Counter = 0;
 
-            var host = TestHelpers.NewJobHost<MyProgWithMethodFilter>();
+            IHost host = new HostBuilder()
+                .ConfigureDefaultTestHost<MyProgWithMethodFilter>()
+                .Build();
 
-            await host.CallAsync(nameof(MyProgWithMethodFilter.Method));
+            var jobHost = host.GetJobHost<MyProgWithMethodFilter>();
+
+            await jobHost.CallAsync(nameof(MyProgWithMethodFilter.Method));
             Assert.Equal(1, MyInvocationFilterAttribute.Counter);
 
-            await host.CallAsync("MyProgWithMethodFilter.Method");
-            await host.CallAsync("MyProgWithMethodFilter.Method");
+            await jobHost.CallAsync("MyProgWithMethodFilter.Method");
+            await jobHost.CallAsync("MyProgWithMethodFilter.Method");
 
             Assert.Equal(1, MyInvocationFilterAttribute.Counter);
         }
@@ -225,10 +264,13 @@ namespace Microsoft.Azure.WebJobs.Host.UnitTests.Executors
         // Verify that all filters share the same instance of the property bag. 
         // Verify the filters can access the arguments. 
         [Fact]
-        public void TestPropertyBag()
+        public async Task TestPropertyBag()
         {
-            var host = TestHelpers.NewJobHost<MyProg6>();
-            host.Call(nameof(MyProg6.Foo), new { myarg = MyProg6.ArgValue });
+            IHost host = new HostBuilder()
+                .ConfigureDefaultTestHost<MyProg6>()
+                .Build();
+
+            await host.GetJobHost<MyProg6>().CallAsync(nameof(MyProg6.Foo), new { myarg = MyProg6.ArgValue });
 
             Assert.Equal("[Pre-Instance][Pre-M1][Post-M1][Post-Instance]", MyProg6._sb.ToString());
         }
@@ -342,20 +384,20 @@ namespace Microsoft.Azure.WebJobs.Host.UnitTests.Executors
                 }
             }
             TestLog.Append("]");
-        }        
+        }
 
         public class MyProgWithMethodFilter
         {
             [MyInvocationFilter]
             [NoAutomaticTrigger]
             public void Method()
-            {                
+            {
             }
         }
 
         [MyInvocationFilter]
         public class MyProgWithClassFilter
-        {            
+        {
             [NoAutomaticTrigger]
             public void Method()
             {
@@ -371,7 +413,7 @@ namespace Microsoft.Azure.WebJobs.Host.UnitTests.Executors
                 Act("New");
             }
 
-            
+
 
             [NoAutomaticTrigger]
             public void Method()
@@ -515,5 +557,5 @@ namespace Microsoft.Azure.WebJobs.Host.UnitTests.Executors
                 return Task.CompletedTask;
             }
         }
-    }    
+    }
 }

@@ -7,6 +7,8 @@ using System.Text;
 using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs.Host.Indexers;
 using Microsoft.Azure.WebJobs.Host.TestCommon;
+using Microsoft.Azure.WebJobs.Hosting;
+using Microsoft.Extensions.Hosting;
 using Newtonsoft.Json;
 using Xunit;
 
@@ -27,7 +29,6 @@ namespace Microsoft.Azure.WebJobs.Host.UnitTests
             public string Bonus { get; set; }
         }
 
-
         public class ErrorProgram
         {
             // Malformed 
@@ -46,15 +47,23 @@ namespace Microsoft.Azure.WebJobs.Host.UnitTests
         [Fact]
         public void TestError()
         {
-            FakeQueueClient client = new FakeQueueClient();
+            IHost host = new HostBuilder()
+                .ConfigureDefaultTestHost<ErrorProgram>(b=>
+                {
+                    b.AddExtension<FakeQueueClient>();
+                })
+                .Build();
+
+            FakeQueueClient client = host.GetExtension<FakeQueueClient>();
+            JobHost jobHost = host.GetJobHost();
+            var p = host.GetTestLoggerProvider();
 
             // Call 'ok' method which has no errors. Should still get the indexing errors from the other method. 
-            var host = TestHelpers.NewJobHost<ErrorProgram>(client);
-            var m = typeof(ErrorProgram).GetMethod("ValidMethod");
+            var m = typeof(ErrorProgram).GetMethod(nameof(ErrorProgram.ValidMethod));
 
             try
             {
-                host.Call("ValidMethod"); // Will force indexing. 
+                jobHost.CallAsync(m); // Will force indexing. 
             }
             catch (FunctionIndexingException e)
             {
@@ -174,50 +183,57 @@ namespace Microsoft.Azure.WebJobs.Host.UnitTests
         }
 
         [Fact]
-        public void Test()
+        public async Task Test()
         {
-            FakeQueueClient client = new FakeQueueClient();
-            var host = TestHelpers.NewJobHost<Functions>(client);
+            IHost host = new HostBuilder()
+                .ConfigureDefaultTestHost<Functions>(b=>
+                {
+                    b.AddExtension<FakeQueueClient>();
+                })
+                .Build();
 
-            var p7 = Invoke(host, client, "SendDirectClient");
-            Assert.Equal(1, p7.Length);
+            JobHost jobHost = host.GetJobHost();
+            FakeQueueClient client = host.GetExtension<FakeQueueClient>();
+
+            var p7 = await InvokeAsync(jobHost, client, "SendDirectClient");
+            Assert.Single(p7);
             Assert.Equal("abc", p7[0].Message);
             Assert.Equal("def", p7[0].ExtraPropertery);
 
-            var p8 = Invoke(host, client, "SendOneDerivedNative");
-            Assert.Equal(1, p8.Length);
+            var p8 = await InvokeAsync(jobHost, client, "SendOneDerivedNative");
+            Assert.Single(p8);
             DerivedFakeQueueData pd8 = (DerivedFakeQueueData)p8[0];
             Assert.Equal("Bonus!", pd8.Bonus); // verify derived prop that wouldn't serialize. 
 
-            var p9 = Invoke(host, client, "SendOneOtherNative");
-            Assert.Equal(1, p9.Length);
+            var p9 = await InvokeAsync(jobHost, client, "SendOneOtherNative");
+            Assert.Single(p9);
             Assert.Equal("direct", p9[0].ExtraPropertery); // Set by the  DirectFakeQueueData.ToEvent
 
             // Single items
-            var p1 = InvokeJson<Payload>(host, client, "SendOnePoco");
-            Assert.Equal(1, p1.Length);
+            var p1 = await InvokeJsonAsync<Payload>(jobHost, client, "SendOnePoco");
+            Assert.Single(p1);
             Assert.Equal(123, p1[0].val1);
 
-            var p2 = Invoke(host, client, "SendOneNative");
-            Assert.Equal(1, p2.Length);
+            var p2 = await InvokeAsync(jobHost, client, "SendOneNative");
+            Assert.Single(p2);
             Assert.Equal("message", p2[0].Message);
             Assert.Equal("extra", p2[0].ExtraPropertery);
 
-            var p3 = Invoke(host, client, "SendOneString");
-            Assert.Equal(1, p3.Length);
+            var p3 = await InvokeAsync(jobHost, client, "SendOneString");
+            Assert.Single(p3);
             Assert.Equal("stringvalue", p3[0].Message);
 
             foreach (string methodName in new string[] { "SendDontQueue", "SendArrayNull", "SendArrayLen0" })
             {
-                var p6 = Invoke(host, client, methodName);
-                Assert.Equal(0, p6.Length);
+                var p6 = await InvokeAsync(jobHost, client, methodName);
+                Assert.Empty(p6);
             }
 
             // batching 
             foreach (string methodName in new string[] {
                 "SendSyncCollectorBytes", "SendArrayString", "SendSyncCollectorString", "SendAsyncCollectorString", "SendCollectorNative" })
             {
-                var p4 = Invoke(host, client, methodName);
+                var p4 = await InvokeAsync(jobHost, client, methodName);
                 Assert.Equal(2, p4.Length);
                 Assert.Equal("first", p4[0].Message);
                 Assert.Equal("second", p4[1].Message);
@@ -225,27 +241,27 @@ namespace Microsoft.Azure.WebJobs.Host.UnitTests
 
             foreach (string methodName in new string[] { "SendCollectorPoco", "SendArrayPoco" })
             {
-                var p5 = InvokeJson<Payload>(host, client, methodName);
+                var p5 = await InvokeJsonAsync<Payload>(jobHost, client, methodName);
                 Assert.Equal(2, p5.Length);
                 Assert.Equal(100, p5[0].val1);
                 Assert.Equal(200, p5[1].val1);
             }
         }
 
-        static FakeQueueData[] Invoke(JobHost host, FakeQueueClient client, string name)
+        static async Task<FakeQueueData[]> InvokeAsync(JobHost host, FakeQueueClient client, string name)
         {
             var method = typeof(Functions).GetMethod(name, BindingFlags.Public | BindingFlags.Static);
-            host.Call(method);
+            await host.CallAsync(method);
 
             var data = client._items.ToArray();
             client._items.Clear();
             return data;
         }
 
-        static T[] InvokeJson<T>(JobHost host, FakeQueueClient client, string name)
+        static async Task<T[]> InvokeJsonAsync<T>(JobHost host, FakeQueueClient client, string name)
         {
             var method = typeof(Functions).GetMethod(name, BindingFlags.Public | BindingFlags.Static);
-            host.Call(method);
+            await host.CallAsync(method);
 
             var data = client._items.ToArray();
 

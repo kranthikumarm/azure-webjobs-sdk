@@ -1,33 +1,42 @@
 ﻿// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
-#if SERVICE_BUS
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.IO;
 using System.Linq;
-using System.Reflection;
+using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
-using Microsoft.Azure.WebJobs.Host.Listeners;
+using Microsoft.Azure.ServiceBus;
+using Microsoft.Azure.ServiceBus.Core;
 using Microsoft.Azure.WebJobs.Host.TestCommon;
 using Microsoft.Azure.WebJobs.ServiceBus;
-using Microsoft.ServiceBus;
-using Microsoft.ServiceBus.Messaging;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using Xunit;
 
 namespace Microsoft.Azure.WebJobs.Host.EndToEndTests
 {
-    public class ServiceBusEndToEndTests
+    public class ServiceBusEndToEndTests : IDisposable
     {
-        private const string PrefixForAll = "t-%rnd%-";
-        private const int SBTimeout = 60 * 1000;
-        private const string QueueNamePrefix = PrefixForAll + "queue-";
-        private const string StartQueueName = QueueNamePrefix + "start";
-        private const string BinderQueueName = QueueNamePrefix + "binder";
+        private const string SecondaryConnectionStringKey = "ServiceBusSecondary";
+        private const string Prefix = "core-test-";
+        private const string FirstQueueName = Prefix + "queue1";
+        private const string SecondQueueName = Prefix + "queue2";
+        private const string BinderQueueName = Prefix + "queue3";
 
-        private const string TopicName = PrefixForAll + "topic";
+        private const string TopicName = Prefix + "topic1";
+        private const string TopicSubscriptionName1 = "sub1";
+        private const string TopicSubscriptionName2 = "sub2";
+
+        private const string TriggerDetailsMessageStart = "Trigger Details:";
+
+        private const int SBTimeout = 60 * 1000;
 
         private static EventWaitHandle _topicSubscriptionCalled1;
         private static EventWaitHandle _topicSubscriptionCalled2;
@@ -36,277 +45,98 @@ namespace Microsoft.Azure.WebJobs.Host.EndToEndTests
         private static string _resultMessage1;
         private static string _resultMessage2;
 
-        private NamespaceManager _namespaceManager;
-        private NamespaceManager _secondaryNamespaceManager;
-        private ServiceBusConfiguration _serviceBusConfig;
-        private RandomNameResolver _nameResolver;
-        private string _secondaryConnectionString;
+        private readonly RandomNameResolver _nameResolver;
+        private readonly string _primaryConnectionString;
+        private readonly string _secondaryConnectionString;
 
         public ServiceBusEndToEndTests()
         {
-            _serviceBusConfig = new ServiceBusConfiguration();
+            var config = new ConfigurationBuilder()
+                .AddEnvironmentVariables()
+                .AddTestSettings()
+                .Build();
+
+            _primaryConnectionString = config.GetConnectionString(ServiceBus.Constants.DefaultConnectionStringName);
+            _secondaryConnectionString = config.GetConnectionString(SecondaryConnectionStringKey);
+
             _nameResolver = new RandomNameResolver();
-            _namespaceManager = NamespaceManager.CreateFromConnectionString(_serviceBusConfig.ConnectionString);
-            _secondaryConnectionString = AmbientConnectionStringProvider.Instance.GetConnectionString("ServiceBusSecondary");
-            _secondaryNamespaceManager = NamespaceManager.CreateFromConnectionString(_secondaryConnectionString);
+
+            Cleanup().GetAwaiter().GetResult();
         }
 
         [Fact]
         public async Task ServiceBusEndToEnd()
         {
-            try
-            {
-                await ServiceBusEndToEndInternal(typeof(ServiceBusTestJobs));
-            }
-            finally
-            {
-                Cleanup();
-            }
-        }
-
-        [Fact]
-        public async Task ServiceBusEndToEnd_RestrictedAccess()
-        {
-            try
-            {
-                // Try running the tests using jobs that declare restricted access
-                // levels. We expect a failure.
-                FunctionListenerException expectedException = null;
-                try
-                {
-                    await ServiceBusEndToEndInternal(typeof(ServiceBusTestJobs_RestrictedAccess));
-                }
-                catch (FunctionListenerException e)
-                {
-                    expectedException = e;
-                }
-                Assert.NotNull(expectedException);
-
-                // Now create the service bus entities
-                string queueName = ResolveName(QueueNamePrefix + "1");
-                _namespaceManager.CreateQueue(queueName);
-
-                string topicName = ResolveName(TopicName);
-                _namespaceManager.CreateTopic(topicName);
-
-                string subscription1 = ResolveName(QueueNamePrefix + "topic-1");
-                _namespaceManager.CreateSubscription(topicName, subscription1);
-
-                string subscription2 = ResolveName(QueueNamePrefix + "topic-2");
-                _namespaceManager.CreateSubscription(topicName, subscription2);
-
-                // Test should now succeed
-                await ServiceBusEndToEndInternal(typeof(ServiceBusTestJobs_RestrictedAccess), verifyLogs: false);
-            }
-            finally
-            {
-                Cleanup();
-            }
-        }
-
-        [Fact]
-        public async Task ServiceBusEndToEnd_CreatesEntities()
-        {
-            JobHost host = null;
-            var startName = ResolveName(StartQueueName);
-            var topicName = ResolveName(TopicName);
-            var queueName = ResolveName(QueueNamePrefix);
-            try
-            {
-                host = CreateHost(typeof(ServiceBusTestJobs_EntityCreation));
-                await host.StartAsync();
-                CreateStartMessage(_serviceBusConfig.ConnectionString, startName);
-                CreateStartMessage(_serviceBusConfig.ConnectionString, startName + '1');
-                CreateStartMessage(_serviceBusConfig.ConnectionString, startName + '2');
-
-                await TestHelpers.Await(() =>
-                {
-                    return _namespaceManager.TopicExists(topicName)
-                      && _namespaceManager.QueueExists(queueName + '1')
-                      && _namespaceManager.QueueExists(queueName + '2');
-                }, 30000);
-
-                Assert.Throws<MessagingException>(() => _namespaceManager.QueueExists(topicName));
-                Assert.Throws<MessagingException>(() => _namespaceManager.TopicExists(queueName + '1'));
-                Assert.Throws<MessagingException>(() => _namespaceManager.TopicExists(queueName + '2'));
-            }
-            finally
-            {
-                host?.StopAsync();
-                host?.Dispose();
-                Cleanup();
-                CleanupQueue(startName + '1');
-                CleanupQueue(startName + '2');
-                CleanupQueue(queueName + '2');
-            }
+            await ServiceBusEndToEndInternal();
         }
 
         [Fact]
         public async Task ServiceBusBinderTest()
         {
             var hostType = typeof(ServiceBusTestJobs);
-            var host = CreateHost(hostType);
+            var host = CreateHost();
             var method = typeof(ServiceBusTestJobs).GetMethod("ServiceBusBinderTest");
 
             int numMessages = 10;
             var args = new { message = "Test Message", numMessages = numMessages };
-            await host.CallAsync(method, args);
-            await host.CallAsync(method, args);
-            await host.CallAsync(method, args);
+            var jobHost = host.GetJobHost<ServiceBusTestJobs>();
+            await jobHost.CallAsync(method, args);
+            await jobHost.CallAsync(method, args);
+            await jobHost.CallAsync(method, args);
 
-            var queueName = ResolveName(BinderQueueName);
-            var queueDescription = await _namespaceManager.GetQueueAsync(queueName);
-            Assert.Equal(numMessages * 3, queueDescription.MessageCount);
+            var count = await CleanUpEntity(BinderQueueName);
+
+            Assert.Equal(numMessages * 3, count);
         }
 
         [Fact]
         public async Task CustomMessageProcessorTest()
         {
-            try
-            {
-                TestTraceWriter trace = new TestTraceWriter(TraceLevel.Info);
-                _serviceBusConfig = new ServiceBusConfiguration();
-                _serviceBusConfig.MessagingProvider = new CustomMessagingProvider(_serviceBusConfig, trace);
-
-                JobHostConfiguration config = new JobHostConfiguration()
+            IHost host = new HostBuilder()
+                .ConfigureDefaultTestHost<ServiceBusTestJobs>(b =>
                 {
-                    NameResolver = _nameResolver,
-                    TypeLocator = new FakeTypeLocator(typeof(ServiceBusTestJobs))
-                };
-                config.Tracing.Tracers.Add(trace);
-                config.UseServiceBus(_serviceBusConfig);
-                JobHost host = new JobHost(config);
+                    b.AddAzureStorage()
+                    .AddServiceBus();
+                })
+                .ConfigureServices(services =>
+                {
+                    services.AddSingleton<MessagingProvider, CustomMessagingProvider>();
+                })
+                .Build();
 
-                await ServiceBusEndToEndInternal(typeof(ServiceBusTestJobs), host: host);
+            var loggerProvider = host.GetTestLoggerProvider();
 
-                // in addition to verifying that our custom processor was called, we're also
-                // verifying here that extensions can log to the TraceWriter
-                Assert.Equal(4, trace.Traces.Count(p => p.Message.Contains("Custom processor Begin called!")));
-                Assert.Equal(4, trace.Traces.Count(p => p.Message.Contains("Custom processor End called!")));
-            }
-            finally
-            {
-                Cleanup();
-            }
+            await ServiceBusEndToEndInternal(host: host);
+
+            // in addition to verifying that our custom processor was called, we're also
+            // verifying here that extensions can log
+            IEnumerable<LogMessage> messages = loggerProvider.GetAllLogMessages().Where(m => m.Category == CustomMessagingProvider.CustomMessagingCategory);
+            Assert.Equal(4, messages.Count(p => p.FormattedMessage.Contains("Custom processor Begin called!")));
+            Assert.Equal(4, messages.Count(p => p.FormattedMessage.Contains("Custom processor End called!")));
         }
 
         [Fact]
         public async Task MultipleAccountTest()
         {
-            try
-            {
-                TestTraceWriter trace = new TestTraceWriter(TraceLevel.Info);
-                _serviceBusConfig = new ServiceBusConfiguration();
-                _serviceBusConfig.MessagingProvider = new CustomMessagingProvider(_serviceBusConfig, trace);
+            IHost host = new HostBuilder()
+               .ConfigureDefaultTestHost<ServiceBusTestJobs>(b =>
+               {
+                   b.AddAzureStorage()
+                   .AddServiceBus();
+               }, nameResolver: _nameResolver)
+               .ConfigureServices(services =>
+               {
+                   services.AddSingleton<MessagingProvider, CustomMessagingProvider>();
+               })
+               .Build();
 
-                JobHostConfiguration config = new JobHostConfiguration()
-                {
-                    NameResolver = _nameResolver,
-                    TypeLocator = new FakeTypeLocator(typeof(ServiceBusTestJobs))
-                };
-                config.Tracing.Tracers.Add(trace);
-                config.UseServiceBus(_serviceBusConfig);
-                JobHost host = new JobHost(config);
-
-                string queueName = ResolveName(StartQueueName);
-                string queuePrefix = queueName.Replace("-queue-start", "");
-                string firstTopicName = string.Format("{0}-topic/Subscriptions/{0}-queue-topic-1", queuePrefix);
-
-                WriteQueueMessage(_secondaryNamespaceManager, _secondaryConnectionString, queueName, "Test");
-
-                _topicSubscriptionCalled1 = new ManualResetEvent(initialState: false);
-
-                await host.StartAsync();
-
-                _topicSubscriptionCalled1.WaitOne(SBTimeout);
-
-                // ensure all logs have had a chance to flush
-                await Task.Delay(3000);
-
-                // Wait for the host to terminate
-                await host.StopAsync();
-                host.Dispose();
-
-                Assert.Equal("Test-topic-1", _resultMessage1);
-            }
-            finally
-            {
-                Cleanup();
-            }
-        }
-
-        private void CleanupQueue(string elementName)
-        {
-            if (_namespaceManager.QueueExists(elementName))
-            {
-                _namespaceManager.DeleteQueue(elementName);
-            }
-        }
-
-        private void Cleanup()
-        {
-            string elementName = ResolveName(StartQueueName);
-            CleanupQueue(elementName);
-
-            if (_secondaryNamespaceManager.QueueExists(elementName))
-            {
-                _secondaryNamespaceManager.DeleteQueue(elementName);
-            }
-
-            elementName = ResolveName(BinderQueueName);
-            CleanupQueue(elementName);
-
-            elementName = ResolveName(QueueNamePrefix + "1");
-            CleanupQueue(elementName);
-
-            elementName = ResolveName(TopicName);
-            if (_namespaceManager.TopicExists(elementName))
-            {
-                _namespaceManager.DeleteTopic(elementName);
-            }
-        }
-
-        private JobHost CreateHost(Type jobContainerType)
-        {
-            JobHostConfiguration config = new JobHostConfiguration()
-            {
-                NameResolver = _nameResolver,
-                TypeLocator = new FakeTypeLocator(jobContainerType)
-            };
-            config.UseServiceBus(_serviceBusConfig);
-            return new JobHost(config);
-        }
-
-        private async Task ServiceBusEndToEndInternal(Type jobContainerType, JobHost host = null, bool verifyLogs = true)
-        {
-            StringWriter consoleOutput = null;
-            TextWriter hold = null;
-            if (verifyLogs)
-            {
-                consoleOutput = new StringWriter();
-                hold = Console.Out;
-                Console.SetOut(consoleOutput);
-            }
-
-            if (host == null)
-            {
-                host = CreateHost(jobContainerType);
-            }
-
-            string startQueueName = ResolveName(StartQueueName);
-            string secondQueueName = startQueueName.Replace("start", "1");
-            string queuePrefix = startQueueName.Replace("-queue-start", "");
-            string firstTopicName = string.Format("{0}-topic/Subscriptions/{0}-queue-topic-1", queuePrefix);
-            string secondTopicName = string.Format("{0}-topic/Subscriptions/{0}-queue-topic-2", queuePrefix);
-            CreateStartMessage(_serviceBusConfig.ConnectionString, startQueueName);
+            await WriteQueueMessage(_secondaryConnectionString, FirstQueueName, "Test");
 
             _topicSubscriptionCalled1 = new ManualResetEvent(initialState: false);
-            _topicSubscriptionCalled2 = new ManualResetEvent(initialState: false);
 
             await host.StartAsync();
 
             _topicSubscriptionCalled1.WaitOne(SBTimeout);
-            _topicSubscriptionCalled2.WaitOne(SBTimeout);
 
             // ensure all logs have had a chance to flush
             await Task.Delay(3000);
@@ -315,101 +145,171 @@ namespace Microsoft.Azure.WebJobs.Host.EndToEndTests
             await host.StopAsync();
             host.Dispose();
 
-            Assert.Equal("E2E-SBQueue2SBQueue-SBQueue2SBTopic-topic-1", _resultMessage1);
-            Assert.Equal("E2E-SBQueue2SBQueue-SBQueue2SBTopic-topic-2", _resultMessage2);
+            Assert.Equal("Test-topic-1", _resultMessage1);
+        }
 
-            if (verifyLogs)
+        private async Task<int> CleanUpEntity(string queueName, string connectionString = null)
+        {
+            var messageReceiver = new MessageReceiver(!string.IsNullOrEmpty(connectionString) ? connectionString : _primaryConnectionString, queueName, ReceiveMode.ReceiveAndDelete);
+            Message message;
+            int count = 0;
+            do
             {
-                Console.SetOut(hold);
+                message = await messageReceiver.ReceiveAsync(TimeSpan.FromSeconds(3)).ConfigureAwait(false);
+                if (message != null)
+                {
+                    count++;
+                }
+                else
+                {
+                    break;
+                }
+            } while (true);
+            await messageReceiver.CloseAsync();
+            return count;
+        }
 
-                string[] consoleOutputLines = consoleOutput.ToString().Trim().Split(new string[] { Environment.NewLine }, StringSplitOptions.None).OrderBy(p => p).ToArray();
+        private async Task Cleanup()
+        {
+            await CleanUpEntity(FirstQueueName);
+            await CleanUpEntity(SecondQueueName);
+            await CleanUpEntity(BinderQueueName);
+            await CleanUpEntity(FirstQueueName, _secondaryConnectionString);
+
+            await CleanUpEntity(EntityNameHelper.FormatSubscriptionPath(TopicName, TopicSubscriptionName1));
+            await CleanUpEntity(EntityNameHelper.FormatSubscriptionPath(TopicName, TopicSubscriptionName2));
+        }
+
+        private IHost CreateHost()
+        {
+            return new HostBuilder()
+                .ConfigureDefaultTestHost<ServiceBusTestJobs>(b =>
+                {
+                    b.AddAzureStorage()
+                    .AddServiceBus();
+                })
+                .ConfigureServices(services =>
+                {
+                    services.AddSingleton<INameResolver>(_nameResolver);
+                })
+                .Build();
+        }
+
+        private async Task ServiceBusEndToEndInternal(IHost host = null)
+        {
+            if (host == null)
+            {
+                host = CreateHost();
+            }
+
+            var jobContainerType = typeof(ServiceBusTestJobs);
+
+            await WriteQueueMessage(_primaryConnectionString, FirstQueueName, "E2E");
+
+            _topicSubscriptionCalled1 = new ManualResetEvent(initialState: false);
+            _topicSubscriptionCalled2 = new ManualResetEvent(initialState: false);
+
+            using (host)
+            {
+                await host.StartAsync();
+
+                _topicSubscriptionCalled1.WaitOne(SBTimeout);
+                _topicSubscriptionCalled2.WaitOne(SBTimeout);
+
+                // ensure all logs have had a chance to flush
+                await Task.Delay(4000);
+
+                // Wait for the host to terminate
+                await host.StopAsync();
+
+                Assert.Equal("E2E-SBQueue2SBQueue-SBQueue2SBTopic-topic-1", _resultMessage1);
+                Assert.Equal("E2E-SBQueue2SBQueue-SBQueue2SBTopic-topic-2", _resultMessage2);
+
+                IEnumerable<LogMessage> logMessages = host.GetTestLoggerProvider()
+                    .GetAllLogMessages();
+
+                // filter out anything from the custom processor for easier validation.
+                IEnumerable<LogMessage> consoleOutput = logMessages
+                    .Where(m => m.Category != CustomMessagingProvider.CustomMessagingCategory);
+
+                Assert.DoesNotContain(consoleOutput, p => p.Level == LogLevel.Error);
+
+                string[] consoleOutputLines = consoleOutput
+                    .Where(p => p.FormattedMessage != null)
+                    .SelectMany(p => p.FormattedMessage.Split(Environment.NewLine, StringSplitOptions.RemoveEmptyEntries))
+                    .OrderBy(p => p)
+                    .ToArray();
+
                 string[] expectedOutputLines = new string[]
                 {
-                    "Found the following functions:",
-                    string.Format("{0}.SBQueue2SBQueue", jobContainerType.FullName),
-                    string.Format("{0}.MultipleAccounts", jobContainerType.FullName),
-                    string.Format("{0}.SBQueue2SBTopic", jobContainerType.FullName),
-                    string.Format("{0}.SBTopicListener1", jobContainerType.FullName),
-                    string.Format("{0}.SBTopicListener2", jobContainerType.FullName),
+                   "Found the following functions:",
+                    $"{jobContainerType.FullName}.SBQueue2SBQueue",
+                    $"{jobContainerType.FullName}.MultipleAccounts",
+                    $"{jobContainerType.FullName}.SBQueue2SBTopic",
+                    $"{jobContainerType.FullName}.SBTopicListener1",
+                    $"{jobContainerType.FullName}.SBTopicListener2",
+                    $"{jobContainerType.FullName}.ServiceBusBinderTest",
                     "Job host started",
-                    string.Format("Executing '{0}.SBQueue2SBQueue' (Reason='New ServiceBus message detected on '{1}'.', Id=", jobContainerType.Name, startQueueName),
-                    string.Format("Executed '{0}.SBQueue2SBQueue' (Succeeded, Id=", jobContainerType.Name),
-                    string.Format("Executing '{0}.SBQueue2SBTopic' (Reason='New ServiceBus message detected on '{1}'.', Id=", jobContainerType.Name, secondQueueName),
-                    string.Format("Executed '{0}.SBQueue2SBTopic' (Succeeded, Id=", jobContainerType.Name),
-                    string.Format("Executing '{0}.SBTopicListener1' (Reason='New ServiceBus message detected on '{1}'.', Id=", jobContainerType.Name, firstTopicName),
-                    string.Format("Executed '{0}.SBTopicListener1' (Succeeded, Id=", jobContainerType.Name),
-                    string.Format("Executing '{0}.SBTopicListener2' (Reason='New ServiceBus message detected on '{1}'.', Id=", jobContainerType.Name, secondTopicName),
-                    string.Format("Executed '{0}.SBTopicListener2' (Succeeded, Id=", jobContainerType.Name),
-                    "Job host stopped"
+                    $"Executing '{jobContainerType.Name}.SBQueue2SBQueue' (Reason='New ServiceBus message detected on '{FirstQueueName}'.', Id=",
+                    $"Executed '{jobContainerType.Name}.SBQueue2SBQueue' (Succeeded, Id=",
+                    $"Trigger Details:",
+                    $"Executing '{jobContainerType.Name}.SBQueue2SBTopic' (Reason='New ServiceBus message detected on '{SecondQueueName}'.', Id=",
+                    $"Executed '{jobContainerType.Name}.SBQueue2SBTopic' (Succeeded, Id=",
+                    $"Trigger Details:",
+                    $"Executing '{jobContainerType.Name}.SBTopicListener1' (Reason='New ServiceBus message detected on '{EntityNameHelper.FormatSubscriptionPath(TopicName, TopicSubscriptionName1)}'.', Id=",
+                    $"Executed '{jobContainerType.Name}.SBTopicListener1' (Succeeded, Id=",
+                    $"Trigger Details:",
+                    $"Executing '{jobContainerType.Name}.SBTopicListener2' (Reason='New ServiceBus message detected on '{EntityNameHelper.FormatSubscriptionPath(TopicName, TopicSubscriptionName2)}'.', Id=",
+                    $"Executed '{jobContainerType.Name}.SBTopicListener2' (Succeeded, Id=",
+                    $"Trigger Details:",
+                    "Job host stopped",
+                    "Starting JobHost",
+                    "Stopping JobHost"
                 }.OrderBy(p => p).ToArray();
 
-                bool hasError = consoleOutputLines.Any(p => p.Contains("Function had errors"));
-                if (!hasError)
+                Action<string>[] inspectors = expectedOutputLines.Select<string, Action<string>>(p => (string m) => m.StartsWith(p)).ToArray();
+                Assert.Collection(consoleOutputLines, inspectors);
+
+                // Verify that trigger details are properly formatted
+                string[] triggerDetailsConsoleOutput = consoleOutputLines
+                    .Where(m => m.StartsWith(TriggerDetailsMessageStart)).ToArray();
+
+                string expectedPattern = "Trigger Details: MessageId: (.*), DeliveryCount: [0-9]+, EnqueuedTime: (.*), LockedUntil: (.*)";
+
+                foreach (string msg in triggerDetailsConsoleOutput)
                 {
-                    for (int i = 0; i < expectedOutputLines.Length; i++)
-                    {
-                        Assert.StartsWith(expectedOutputLines[i], consoleOutputLines[i]);
-                    }
+                    Assert.True(Regex.IsMatch(msg, expectedPattern), $"Expected trace event {expectedPattern} not found.");
                 }
             }
         }
 
-        private void CreateStartMessage(string serviceBusConnectionString, string queueName)
+        private async Task WriteQueueMessage(string connectionString, string queueName, string message)
         {
-            WriteQueueMessage(_namespaceManager, serviceBusConnectionString, queueName, "E2E");
-        }
-
-        private void WriteQueueMessage(NamespaceManager namespaceManager, string connectionString, string queueName, string message)
-        {
-            if (!namespaceManager.QueueExists(queueName))
-            {
-                namespaceManager.CreateQueue(queueName);
-            }
-
-            QueueClient queueClient = QueueClient.CreateFromConnectionString(connectionString, queueName);
-
-            using (Stream stream = new MemoryStream())
-            using (TextWriter writer = new StreamWriter(stream))
-            {
-                writer.Write(message);
-                writer.Flush();
-                stream.Position = 0;
-
-                queueClient.Send(new BrokeredMessage(stream) { ContentType = "text/plain" });
-            }
-
-            queueClient.Close();
-        }
-
-        // Workaround for the fact that the name resolve only resolves the %%-token
-        private string ResolveName(string name)
-        {
-            return name.Replace("%rnd%", _nameResolver.Resolve("rnd"));
+            QueueClient queueClient = new QueueClient(connectionString, queueName);
+            await queueClient.SendAsync(new Message(Encoding.UTF8.GetBytes(message)));
+            await queueClient.CloseAsync();
         }
 
         public abstract class ServiceBusTestJobsBase
         {
-            protected static string SBQueue2SBQueue_GetOutputMessage(string input)
+            protected static Message SBQueue2SBQueue_GetOutputMessage(string input)
             {
-                return input + "-SBQueue2SBQueue";
+                input = input + "-SBQueue2SBQueue";
+                return new Message
+                {
+                    ContentType = "text/plain",
+                    Body = Encoding.UTF8.GetBytes(input)
+                };
             }
 
-            protected static BrokeredMessage SBQueue2SBTopic_GetOutputMessage(string input)
+            protected static Message SBQueue2SBTopic_GetOutputMessage(string input)
             {
                 input = input + "-SBQueue2SBTopic";
 
-                Stream stream = new MemoryStream();
-                TextWriter writer = new StreamWriter(stream);
-                writer.Write(input);
-                writer.Flush();
-                stream.Position = 0;
-
-                BrokeredMessage output = new BrokeredMessage(stream)
+                return new Message(Encoding.UTF8.GetBytes(input))
                 {
                     ContentType = "text/plain"
                 };
-
-                return output;
             }
 
             protected static void SBTopicListener1Impl(string input)
@@ -418,9 +318,9 @@ namespace Microsoft.Azure.WebJobs.Host.EndToEndTests
                 _topicSubscriptionCalled1.Set();
             }
 
-            protected static void SBTopicListener2Impl(BrokeredMessage message)
+            protected static void SBTopicListener2Impl(Message message)
             {
-                using (Stream stream = message.GetBody<Stream>())
+                using (Stream stream = new MemoryStream(message.Body))
                 using (TextReader reader = new StreamReader(stream))
                 {
                     _resultMessage2 = reader.ReadToEnd() + "-topic-2";
@@ -433,25 +333,35 @@ namespace Microsoft.Azure.WebJobs.Host.EndToEndTests
         public class ServiceBusTestJobs : ServiceBusTestJobsBase
         {
             // Passes service bus message from a queue to another queue
-            public static void SBQueue2SBQueue(
-                [ServiceBusTrigger(StartQueueName)] string start, int deliveryCount,
-                [ServiceBus(QueueNamePrefix + "1")] out string message)
+            public static async Task SBQueue2SBQueue(
+                [ServiceBusTrigger(FirstQueueName)] string start, int deliveryCount,
+                MessageReceiver messageReceiver,
+                string lockToken,
+                [ServiceBus(SecondQueueName)] MessageSender messageSender)
             {
+                Assert.Equal(FirstQueueName, messageReceiver.Path);
                 Assert.Equal(1, deliveryCount);
-                message = SBQueue2SBQueue_GetOutputMessage(start);
+
+                // verify the message receiver and token are valid
+                await messageReceiver.RenewLockAsync(lockToken);
+
+                var message = SBQueue2SBQueue_GetOutputMessage(start);
+                await messageSender.SendAsync(message);
             }
 
             // Passes a service bus message from a queue to topic using a brokered message
             public static void SBQueue2SBTopic(
-                [ServiceBusTrigger(QueueNamePrefix + "1")] string message,
-                [ServiceBus(TopicName)] out BrokeredMessage output)
+                [ServiceBusTrigger(SecondQueueName)] string message,
+                [ServiceBus(TopicName)] out Message output)
             {
                 output = SBQueue2SBTopic_GetOutputMessage(message);
             }
 
             // First listener for the topic
             public static void SBTopicListener1(
-                [ServiceBusTrigger(TopicName, QueueNamePrefix + "topic-1")] string message)
+                [ServiceBusTrigger(TopicName, TopicSubscriptionName1)] string message,
+                MessageReceiver messageReceiver,
+                string lockToken)
             {
                 SBTopicListener1Impl(message);
             }
@@ -461,7 +371,7 @@ namespace Microsoft.Azure.WebJobs.Host.EndToEndTests
             // for ServiceBus.
             [Singleton]
             public static void SBTopicListener2(
-                [ServiceBusTrigger(TopicName, QueueNamePrefix + "topic-2")] BrokeredMessage message)
+                [ServiceBusTrigger(TopicName, TopicSubscriptionName2)] Message message)
             {
                 SBTopicListener2Impl(message);
             }
@@ -469,7 +379,7 @@ namespace Microsoft.Azure.WebJobs.Host.EndToEndTests
             // Demonstrate triggering on a queue in one account, and writing to a topic
             // in the primary subscription
             public static void MultipleAccounts(
-                [ServiceBusTrigger(StartQueueName, Connection = "ServiceBusSecondary")] string input,
+                [ServiceBusTrigger(FirstQueueName, Connection = SecondaryConnectionStringKey)] string input,
                 [ServiceBus(TopicName)] out string output)
             {
                 output = input;
@@ -486,7 +396,7 @@ namespace Microsoft.Azure.WebJobs.Host.EndToEndTests
                     EntityType = EntityType.Queue
                 };
                 var collector = await binder.BindAsync<IAsyncCollector<string>>(attribute);
-                
+
                 for (int i = 0; i < numMessages; i++)
                 {
                     await collector.AddAsync(message + i);
@@ -496,132 +406,64 @@ namespace Microsoft.Azure.WebJobs.Host.EndToEndTests
             }
         }
 
-        /// <summary>
-        /// This test class declares the same job functions, but with restricted AccessRights.
-        /// This means the framework will not create any SB queues/topics/subscriptions if they
-        /// don't already exist.
-        /// </summary>
-        public class ServiceBusTestJobs_RestrictedAccess : ServiceBusTestJobsBase
-        {
-            // Passes  service bus message from a queue to another queue
-            public static void SBQueue2SBQueue(
-                [ServiceBusTrigger(StartQueueName, AccessRights.Listen)] string start,
-                [ServiceBus(QueueNamePrefix + "1", AccessRights.Send)] out string message)
-            {
-                message = SBQueue2SBQueue_GetOutputMessage(start);
-            }
-
-            // Passes a service bus message from a queue to topic using a brokered message
-            public static void SBQueue2SBTopic(
-                [ServiceBusTrigger(QueueNamePrefix + "1", AccessRights.Listen)] string message,
-                [ServiceBus(TopicName, AccessRights.Send)] out BrokeredMessage output)
-            {
-                output = SBQueue2SBTopic_GetOutputMessage(message);
-            }
-
-            // First listener for the topic
-            public static void SBTopicListener1(
-                [ServiceBusTrigger(TopicName, QueueNamePrefix + "topic-1", AccessRights.Listen)] string message)
-            {
-                SBTopicListener1Impl(message);
-            }
-
-            // Second listerner for the topic
-            public static void SBTopicListener2(
-                [ServiceBusTrigger(TopicName, QueueNamePrefix + "topic-2", AccessRights.Listen)] BrokeredMessage message)
-            {
-                SBTopicListener2Impl(message);
-            }
-        }
-
-        public class ServiceBusTestJobs_EntityCreation : ServiceBusTestJobsBase
-        {
-            public static void SBQueueTriggerToTopicOutput(
-                [ServiceBusTrigger(StartQueueName)] string message,
-                [ServiceBus(TopicName, EntityType = EntityType.Topic)] out string output)
-            {
-                output = "should create topic";
-            }
-
-            public static void SBQueueTriggerToDefaultOutput(
-                [ServiceBusTrigger(StartQueueName + "1")] string message,
-                [ServiceBus(QueueNamePrefix + "1")] out string output)
-            {
-                output = "should create queue";
-            }
-
-            public static void SBQueueTriggerToQueueOutput(
-                [ServiceBusTrigger(StartQueueName + "2")] string message,
-                [ServiceBus(QueueNamePrefix + "2", EntityType = EntityType.Queue)] out string output)
-            {
-                output = "should create queue";
-            }
-        }
-
         private class CustomMessagingProvider : MessagingProvider
         {
-            private readonly ServiceBusConfiguration _config;
-            private readonly TraceWriter _trace;
+            public const string CustomMessagingCategory = "CustomMessagingProvider";
+            private readonly ILogger _logger;
+            private readonly ServiceBusOptions _options;
 
-            public CustomMessagingProvider(ServiceBusConfiguration config, TraceWriter trace)
-                : base(config)
+            public CustomMessagingProvider(IOptions<ServiceBusOptions> serviceBusOptions, ILoggerFactory loggerFactory)
+                : base(serviceBusOptions)
             {
-                _config = config;
-                _trace = trace;
+                _options = serviceBusOptions.Value;
+                _logger = loggerFactory?.CreateLogger(CustomMessagingCategory);
             }
 
-            public override MessageProcessor CreateMessageProcessor(string entityPath)
+            public override MessageProcessor CreateMessageProcessor(string entityPath, string connectionName = null)
             {
-                // demonstrate overriding the default message options
-                OnMessageOptions messageOptions = new OnMessageOptions
+                var options = new MessageHandlerOptions(ExceptionReceivedHandler)
                 {
                     MaxConcurrentCalls = 3,
-                    AutoRenewTimeout = TimeSpan.FromMinutes(1)
+                    MaxAutoRenewDuration = TimeSpan.FromMinutes(1)
                 };
 
-                return new CustomMessageProcessor(messageOptions, _trace);
-            }
+                var messageReceiver = new MessageReceiver(_options.ConnectionString, entityPath);
 
-            public override MessagingFactory CreateMessagingFactory(string entityPath, string connectionStringName = null)
-            {
-                // demonstrate that the MessagingFactory can be customized
-                // per queue/topic
-                string connectionString = GetConnectionString(connectionStringName);
-                MessagingFactory factory = MessagingFactory.CreateFromConnectionString(connectionString);
-                MessagingFactorySettings settings = factory.GetSettings();
-                settings.OperationTimeout = TimeSpan.FromSeconds(15);
-
-                return MessagingFactory.Create(factory.Address, settings);
-            }
-
-            public override NamespaceManager CreateNamespaceManager(string connectionStringName = null)
-            {
-                return base.CreateNamespaceManager(connectionStringName);
+                return new CustomMessageProcessor(messageReceiver, options, _logger);
             }
 
             private class CustomMessageProcessor : MessageProcessor
             {
-                private readonly TraceWriter _trace;
+                private readonly ILogger _logger;
 
-                public CustomMessageProcessor(OnMessageOptions messageOptions, TraceWriter trace)
-                    : base(messageOptions)
+                public CustomMessageProcessor(MessageReceiver messageReceiver, MessageHandlerOptions messageOptions, ILogger logger)
+                    : base(messageReceiver, messageOptions)
                 {
-                    _trace = trace;
+                    _logger = logger;
                 }
 
-                public override async Task<bool> BeginProcessingMessageAsync(BrokeredMessage message, CancellationToken cancellationToken)
+                public override async Task<bool> BeginProcessingMessageAsync(Message message, CancellationToken cancellationToken)
                 {
-                    _trace.Info("Custom processor Begin called!");
+                    _logger?.LogInformation("Custom processor Begin called!");
                     return await base.BeginProcessingMessageAsync(message, cancellationToken);
                 }
 
-                public override async Task CompleteProcessingMessageAsync(BrokeredMessage message, Executors.FunctionResult result, CancellationToken cancellationToken)
+                public override async Task CompleteProcessingMessageAsync(Message message, Executors.FunctionResult result, CancellationToken cancellationToken)
                 {
-                    _trace.Info("Custom processor End called!");
+                    _logger?.LogInformation("Custom processor End called!");
                     await base.CompleteProcessingMessageAsync(message, result, cancellationToken);
                 }
             }
+
+            private Task ExceptionReceivedHandler(ExceptionReceivedEventArgs eventArgs)
+            {
+                return Task.CompletedTask;
+            }
+        }
+
+        public void Dispose()
+        {
+            Cleanup().GetAwaiter().GetResult();
         }
     }
 }
-#endif

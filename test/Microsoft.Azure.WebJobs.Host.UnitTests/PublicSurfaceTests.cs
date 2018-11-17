@@ -1,10 +1,8 @@
 ﻿// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
-using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Reflection;
+using Microsoft.Azure.WebJobs.Description;
+using Microsoft.Azure.WebJobs.Host.TestCommon;
 using Microsoft.Azure.WebJobs.Logging;
 using Microsoft.Azure.WebJobs.Logging.ApplicationInsights;
 using Xunit;
@@ -19,33 +17,21 @@ namespace Microsoft.Azure.WebJobs.Host.UnitTests
     public class PublicSurfaceTests
     {
         [Fact]
-        public void AssemblyReferences_InJobsAssembly()
+        public void WebJobs_Host_VerifyAssemblyReferences()
         {
-            // The DLL containing the binding attributes should be truly minimal and have no extra dependencies. 
-            var names = GetAssemblyReferences(typeof(QueueTriggerAttribute).Assembly);
-
-            Assert.Equal(2, names.Count);
-            Assert.Equal("netstandard", names[0]);
-            Assert.Equal("System.ComponentModel.Annotations", names[1]);
-        }
-
-        [Fact]
-        public void AssemblyReferences_InJobsHostAssembly()
-        {
-            var names = GetAssemblyReferences(typeof(JobHost).Assembly);
+            var names = TestHelpers.GetAssemblyReferences(typeof(JobHost).Assembly);
 
             foreach (var name in names)
             {
                 if (name.StartsWith("Microsoft.WindowsAzure"))
                 {
-                    // Only azure dependency is on the storage sdk
-                    Assert.Equal("Microsoft.WindowsAzure.Storage", name);
+                    Assert.True(false, "Should not have azure dependency: " + name);
                 }
             }
         }
 
         [Fact]
-        public void LoggingPublicSurface_LimitedToSpecificTypes()
+        public void WebJobs_Logging_VerifyPublicSurfaceArea()
         {
             var assembly = typeof(ILogWriter).Assembly;
 
@@ -72,243 +58,209 @@ namespace Microsoft.Azure.WebJobs.Host.UnitTests
                 "Segment`1"
             };
 
-            AssertPublicTypes(expected, assembly);
+            TestHelpers.AssertPublicTypes(expected, assembly);
         }
 
-#if SERVICE_BUS
         [Fact]
-        public void ServiceBusPublicSurface_LimitedToSpecificTypes()
+        public void WebJobs_VerifyPublicSurfaceArea()
         {
-            var assembly = typeof(ServiceBusAttribute).Assembly;
+            // The core WebJobs assembly should be truly minimal and have no extra dependencies. 
+            var assembly = typeof(AutoResolveAttribute).Assembly;
 
             var expected = new[]
             {
-                "EntityType",
-                "EventHubAttribute",
-                "EventHubConfiguration",
-                "EventHubJobHostConfigurationExtensions",
-                "EventHubTriggerAttribute",
-                "EventHubAsyncCollector",
-                "MessageProcessor",
-                "MessagingProvider",
-                "ServiceBusAccountAttribute",
-                "ServiceBusAttribute",
-                "ServiceBusConfiguration",
-                "ServiceBusJobHostConfigurationExtensions",
-                "ServiceBusTriggerAttribute"
-            };
-
-            AssertPublicTypes(expected, assembly);
-        }
-#endif
-
-        [Fact]
-        public void WebJobsPublicSurface_LimitedToSpecificTypes()
-        {
-            var assembly = typeof(QueueTriggerAttribute).Assembly;
-
-            var expected = new[]
-            {
-                "IAttributeInvokeDescriptor`1",
-                "BindingAttribute",
-                "AutoResolveAttribute",
                 "AppSettingAttribute",
+                "AutoResolveAttribute",
                 "BinderExtensions",
-                "BlobAttribute",
-                "BlobTriggerAttribute",                
-                "IBinder",
+                "BindingAttribute",
+                "ConnectionProviderAttribute",
+                "ConnectionStringAttribute",
+                "DisableAttribute",
+                "ExtensionAttribute",
+                "FunctionNameAttribute",
                 "IAsyncCollector`1",
+                "IAttributeInvokeDescriptor`1",
+                "IBinder",
                 "ICollector`1",
-                "ICloudBlobStreamBinder`1",
+                "IConnectionProvider",
                 "NoAutomaticTriggerAttribute",
-                "QueueAttribute",
-                "QueueTriggerAttribute",
-                "TableAttribute",
                 "SingletonAttribute",
                 "SingletonMode",
                 "SingletonScope",
-                "IConnectionProvider",
-                "ConnectionProviderAttribute",
                 "StorageAccountAttribute",
-                "DisableAttribute",
-                "TimeoutAttribute",
-                "TraceLevelAttribute",
-                "ODataFilterResolutionPolicy",
-                "FunctionNameAttribute"
+                "TimeoutAttribute"
             };
 
-            AssertPublicTypes(expected, assembly);
+            TestHelpers.AssertPublicTypes(expected, assembly);
         }
 
         [Fact]
-        public void WebJobsHostPublicSurface_LimitedToSpecificTypes()
+        public void WebJobs_Host_VerifyPublicSurfaceArea()
         {
             var assembly = typeof(Microsoft.Azure.WebJobs.JobHost).Assembly;
 
             var expected = new[]
             {
-                "DefaultNameResolver",
-                "FunctionInstanceLogEntry",
-                "IConverter`2",
-                "IAsyncConverter`2",
-                "IConverterManager",
-                "IConverterManagerExtensions",
-                "FuncConverter`3",
-                "BindingFactory",
-                "ITriggerBindingStrategy`2",
-                "ConnectionStringNames",
-                "JobHost",
-                "JobHostConfiguration",
-                "JobHostQueuesConfiguration",
-                "JobHostBlobsConfiguration",
-                "IJobActivator",
-                "ITypeLocator",
-                "INameResolver",
-                "WebJobsShutdownWatcher",
+                "ApplyConversion`2",
+                "AssemblyNameCache",
+                "Binder",
                 "BindingContext",
+                "BindingDataProvider",
+                "BindingFactory",
                 "BindingProviderContext",
                 "BindingTemplate",
-                "BindStepOrder",
-                "FluentBindingRule`1",
-                "IJobHostMetadataProvider",
-                "FluentConverterRules`2",
-                "IWebHookProvider",
-                "OpenType",
-                "FunctionBindingContext",
-                "IBinding",
-                "IBindingProvider",
-                "IExtensionConfigProvider",
-                "IExtensionRegistry",
-                "IListener",
-                "IOrderedValueBinder",
-                "ITriggerBinding",
-                "ITriggerBindingProvider",
-                "ITriggerData",
-                "IValueBinder",
-                "IValueProvider",
-                "NameResolverExtensions",
-                "FunctionDescriptor",
-                "ParameterDescriptor",
-                "ParameterDisplayHints",
-                "TriggerBindingProviderContext",
-                "TriggerData",
-                "TriggerParameterDescriptor",
-                "ValueBindingContext",
-                "AmbientConnectionStringProvider",
-                "IExtensionRegistryExtensions",
-                "ITriggeredFunctionExecutor",
-                "ListenerFactoryContext",
-                "BindingTemplateSource",
-                "TriggeredFunctionData",
-                "ExtensionConfigContext",
-                "ExtensionConfigContextExtensions",
-                "IQueueProcessorFactory",
-                "QueueProcessorFactoryContext",
-                "QueueProcessor",
-                "FunctionResult",
-                "IArgumentBinding`1",
-                "IArgumentBindingProvider`1",
-                "SingletonConfiguration",
-                "TraceWriter",
-                "JobHostTraceConfiguration",
-                "StorageClientFactory",
-                "StorageClientFactoryContext",
-                "BindingDataProvider",
-                "IBindingDataProvider",
-                "FunctionInvocationException",
-                "TraceEvent",
                 "BindingTemplateExtensions",
-                "FunctionIndexingException",
-                "Binder",
-                "IWebJobsExceptionHandler",
-                "WebJobsExceptionHandler",
-                "FunctionTimeoutException",
-                "PoisonMessageEventArgs",
-                "IResolutionPolicy",
-                "RecoverableException",
-                "FunctionException",
-                "FunctionListenerException",
+                "BindingTemplateSource",
+                "BindStepOrder",
+                "ConnectionStringNames",
+                "DefaultExtensionRegistry",
+                "DefaultExtensionRegistryFactory",
+                "DefaultNameResolver",
+                "DefaultWebJobsExceptionHandlerFactory",
+                "DirectInvokeString",
                 "ExceptionFormatter",
-                "FunctionResultAggregatorConfiguration",
-                "LogCategoryFilter",
-                "LogCategories",
-                "LogConstants",
-                "ScopeKeys",
-                "IDistributedLockManager",
-                "IDistributedLock",
-                "AssemblyNameCache",
+                "ExecutionContext",
+                "ExecutionContextOptions",
+                "ExecutionReason",
+                "ExtensionConfigContext",
+                "ExtensionInfo",
+                "FluentBinder",
+                "FluentBindingRule`1",
+                "FluentConverterRules`2",
+                "FuncAsyncConverter",
+                "FuncAsyncConverter`2",
+                "FuncConverterBuilder",
+                "FunctionBindingContext",
+                "FunctionDescriptor",
+                "FunctionException",
                 "FunctionExceptionContext",
                 "FunctionExceptionFilterAttribute",
                 "FunctionExecutedContext",
                 "FunctionExecutingContext",
                 "FunctionFilterContext",
+                "FunctionIndexingException",
+                "FunctionInstanceFactoryContext",
+                "FunctionInstanceLogEntry",
                 "FunctionInvocationContext",
+                "FunctionInvocationException",
                 "FunctionInvocationFilterAttribute",
+                "FunctionListenerException",
+                "FunctionMetadata",
+                "FunctionResult",
+                "FunctionResultAggregatorOptions",
+                "FunctionTimeoutException",
+                "IArgumentBinding`1",
+                "IArgumentBindingProvider`1",
+                "IAsyncConverter`2",
+                "IBinding",
+                "IBindingDataProvider",
+                "IBindingProvider",
+                "IBindingSource",
+                "IConverter`2",
+                "IConverterManager",
+                "IConverterManagerExtensions",
+                "IDelayedException",
+                "IDistributedLock",
+                "IDistributedLockManager",
+                "IEventCollectorFactory",
+                "IEventCollectorProvider",
+                "IExtensionConfigProvider",
+                "IExtensionRegistry",
+                "IExtensionRegistryExtensions",
+                "IExtensionRegistryFactory",
+                "IFunctionDefinition",
                 "IFunctionExceptionFilter",
+                "IFunctionExecutor",
                 "IFunctionFilter",
+                "IFunctionIndexLookup",
+                "IFunctionInstance",
+                "IFunctionInstanceFactory",
                 "IFunctionInvocationFilter",
-                "LoggerExtensions"
+                "IFunctionInvoker",
+                "IHostIdProvider",
+                "IHostSingletonManager",
+                "IJobActivator",
+                "IJobHost",
+                "IJobHostContextFactory",
+                "IJobHostMetadataProvider",
+                "IJobHostMetadataProviderFactory",
+                "IListener",
+                "IListenerFactory",
+                "ILoadBalancerQueue",
+                "INameResolver",
+                "IOrderedValueBinder",
+                "IResolutionPolicy",
+                "ITriggerBinding",
+                "ITriggerBindingProvider",
+                "ITriggerBindingStrategy`2",
+                "ITriggerData",
+                "ITriggeredFunctionExecutor",
+                "ITypeLocator",
+                "IValueBinder",
+                "IValueProvider",
+                "IWatchable",
+                "IWatcher",
+                "IWebHookProvider",
+                "IWebJobsExceptionHandler",
+                "IWebJobsExceptionHandlerFactory",
+                "IWebJobsExtensionBuilder",
+                "IWebJobsExtensionConfiguration`1",
+                "IWebJobsStartup",
+                "IWebJobsStartupTypeLocator",
+                "JobHost",
+                "JobHostContext",
+                "JobHostFunctionTimeoutOptions",
+                "JobHostOptions",
+                "JobHostService",
+                "ListenerFactoryContext",
+                "LogCategories",
+                "LogConstants",
+                "LoggerExtensions",
+                "NameResolverExtensions",
+                "OpenType",
+                "OpenTypeMatchContext",
+                "ParameterDescriptor",
+                "ParameterDisplayHints",
+                "ParameterLog",
+                "Poco",
+                "RecoverableException",
+                "ScopeKeys",
+                "SingletonOptions",
+                "TraceEvent",
+                "TraceWriter",
+                "TriggerBindingProviderContext",
+                "TriggerData",
+                "TriggeredFunctionData",
+                "TriggerParameterDescriptor",
+                "ValueBindingContext",
+                "IWebJobsBuilder",
+                "WebJobsBuilderExtensions",
+                "WebJobsExceptionHandler",
+                "WebJobsExtensionBuilderExtensions",
+                "WebJobsHostBuilderExtensions",
+                "WebJobsServiceCollectionExtensions",
+                "WebJobsShutdownWatcher",
+                "WebJobsStartupAttribute",
+                "IConfigurationExtensions"
             };
 
-            AssertPublicTypes(expected, assembly);
+            TestHelpers.AssertPublicTypes(expected, assembly);
         }
 
         [Fact]
-        public void ApplicationInsightsPublicSurface_LimitedToSpecificTypes()
+        public void WebJobs_Logging_ApplicationInsights_VerifyPublicSurfaceArea()
         {
             var assembly = typeof(ApplicationInsightsLogger).Assembly;
 
             var expected = new[]
             {
-                "ITelemetryClientFactory",
-                "DefaultTelemetryClientFactory",
-                "ApplicationInsightsLoggerExtensions"
+                "ApplicationInsightsLoggerOptions",
+                "ApplicationInsightsLoggerProvider",
+                "ApplicationInsightsLoggingBuilderExtensions",
+                "ISdkVersionProvider"
             };
 
-            AssertPublicTypes(expected, assembly);
-        }
-
-        private static List<string> GetAssemblyReferences(Assembly assembly)
-        {
-            var assemblyRefs = assembly.GetReferencedAssemblies();
-            var names = (from assemblyRef in assemblyRefs
-                         orderby assemblyRef.Name.ToLowerInvariant()
-                         select assemblyRef.Name).ToList();
-            return names;
-        }
-
-        private static void AssertPublicTypes(IEnumerable<string> expected, Assembly assembly)
-        {
-            var publicTypes = (assembly.GetExportedTypes()
-                .Select(type => type.Name)
-                .OrderBy(n => n));
-
-            AssertPublicTypes(expected.ToArray(), publicTypes.ToArray());
-        }
-
-        private static void AssertPublicTypes(string[] expected, string[] actual)
-        {
-            var newlyIntroducedPublicTypes = actual.Except(expected).ToArray();
-
-            if (newlyIntroducedPublicTypes.Length > 0)
-            {
-                string message = String.Format("Found {0} unexpected public type{1}: \r\n{2}",
-                    newlyIntroducedPublicTypes.Length,
-                    newlyIntroducedPublicTypes.Length == 1 ? "" : "s",
-                    string.Join("\r\n", newlyIntroducedPublicTypes));
-                Assert.True(false, message);
-            }
-
-            var missingPublicTypes = expected.Except(actual).ToArray();
-
-            if (missingPublicTypes.Length > 0)
-            {
-                string message = String.Format("missing {0} public type{1}: \r\n{2}",
-                    missingPublicTypes.Length,
-                    missingPublicTypes.Length == 1 ? "" : "s",
-                    string.Join("\r\n", missingPublicTypes));
-                Assert.True(false, message);
-            }
+            TestHelpers.AssertPublicTypes(expected, assembly);
         }
     }
 }

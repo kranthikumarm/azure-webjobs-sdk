@@ -6,7 +6,10 @@ using System.Threading.Tasks;
 
 namespace Microsoft.Azure.WebJobs.Host.Executors
 {
-    internal interface IHostIdProvider
+    /// <summary>
+    /// Interface for providing a unique host identifier. 
+    /// </summary>
+    public interface IHostIdProvider
     {
         Task<string> GetHostIdAsync(CancellationToken cancellationToken);
     }

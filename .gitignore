@@ -3,6 +3,7 @@ obj
 csx
 .vs
 .DS_Store
+.vscode
 
 *.user
 *.suo
@@ -11,5 +12,6 @@ csx
 
 /packages
 /TestResults
+/buildoutput
 
 /tools/NuGet.exe

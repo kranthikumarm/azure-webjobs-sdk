@@ -2,6 +2,7 @@
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
+using System.Collections.Generic;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -9,6 +10,8 @@ using Microsoft.Azure.WebJobs.Description;
 using Microsoft.Azure.WebJobs.Host.Config;
 using Microsoft.Azure.WebJobs.Host.Loggers;
 using Microsoft.Azure.WebJobs.Host.TestCommon;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 using Xunit;
 
 namespace Microsoft.Azure.WebJobs.Host.UnitTests.Loggers
@@ -27,32 +30,64 @@ namespace Microsoft.Azure.WebJobs.Host.UnitTests.Loggers
 
         // Test that instrumentation points are emitted in the right order.
         [Fact]
-        public void TestSuccess()
+        public async Task TestSuccess()
         {
             var logger = new MyLogger();
-            var host = TestHelpers.NewJobHost<MyProg>(logger, new TestExt());
-            host.Call("test");
+
+            IHost host = new HostBuilder()
+                .ConfigureDefaultTestHost<MyProg>(b =>
+                {
+                    b.AddExtension<TestExt>();
+                })
+                .ConfigureServices(services =>
+                {
+                    services.AddSingleton<IAsyncCollector<FunctionInstanceLogEntry>>(logger);
+                })
+                .Build();
+
+            await host.GetJobHost<MyProg>().CallAsync("test");
 
             Assert.Equal(PreBindLog + ParamLog + PostBindLog + BodyLog + CompletedLog, logger._log.ToString());
         }
 
         [Fact]
-        public void TestWithFailParam()
+        public async Task TestWithFailParam()
         {
             var logger = new MyLogger();
-            var host = TestHelpers.NewJobHost<MyProg>(logger, new TestExt());
 
-            Assert.Throws<FunctionInvocationException>(() => host.Call("testFailParam"));
+            IHost host = new HostBuilder()
+             .ConfigureDefaultTestHost<MyProg>(b =>
+             {
+                 b.AddExtension<TestExt>();
+             })
+             .ConfigureServices(services =>
+             {
+                 services.AddSingleton<IAsyncCollector<FunctionInstanceLogEntry>>(logger);
+             })
+             .Build();
+
+            await Assert.ThrowsAsync<FunctionInvocationException>(() => host.GetJobHost<MyProg>().CallAsync("testFailParam"));
 
             Assert.Equal(PreBindLog + ParamFailLog + PostBindLog + CompletedFailLog, logger._log.ToString());
         }
 
         [Fact]
-        public void TestWithFailBody()
+        public async Task TestWithFailBody()
         {
             var logger = new MyLogger();
-            var host = TestHelpers.NewJobHost<MyProg>(logger, new TestExt());
-            Assert.Throws<FunctionInvocationException>(() => host.Call("testFailBody"));
+
+            IHost host = new HostBuilder()
+                .ConfigureDefaultTestHost<MyProg>(b =>
+                {
+                    b.AddExtension<TestExt>();
+                })
+                .ConfigureServices(services =>
+                {
+                    services.AddSingleton<IAsyncCollector<FunctionInstanceLogEntry>>(logger);
+                })
+                .Build();
+
+            await Assert.ThrowsAsync<FunctionInvocationException>(() => host.GetJobHost<MyProg>().CallAsync("testFailBody"));
 
             Assert.Equal(PreBindLog + ParamLog + PostBindLog + BodyFailLog + CompletedFailLog, logger._log.ToString());
         }
@@ -117,24 +152,31 @@ namespace Microsoft.Azure.WebJobs.Host.UnitTests.Loggers
         }
 
         [Binding]
-        public class LoggerTestAttribute : Attribute {
+        public class LoggerTestAttribute : Attribute
+        {
             public bool Fail { get; set; }
         }
 
         public class TestExt : IExtensionConfigProvider
         {
-            public void Initialize(ExtensionConfigContext context)
+            MyLogger _logger;
+
+            public TestExt(IAsyncCollector<FunctionInstanceLogEntry> logger)
             {
-                var logger = (MyLogger)context.Config.GetService<IAsyncCollector<FunctionInstanceLogEntry>>();
+                _logger = (MyLogger)logger;
+            }
+
+            public void Initialize(ExtensionConfigContext context)
+            {                
                 context.AddBindingRule<LoggerTestAttribute>().BindToInput(attr =>
                 {
                     if (attr.Fail)
                     {
-                        logger._log.Append(ParamFailLog);
+                        _logger._log.Append(ParamFailLog);
                         throw new InvalidOperationException("Paramter binding fored failure");
                     }
-                    logger._log.Append(ParamLog);
-                    return logger;
+                    _logger._log.Append(ParamLog);
+                    return _logger;
                 });
             }
         }
@@ -143,7 +185,7 @@ namespace Microsoft.Azure.WebJobs.Host.UnitTests.Loggers
         public class MyProg
         {
             [NoAutomaticTrigger]
-            public void test([LoggerTest] MyLogger logger )
+            public void test([LoggerTest] MyLogger logger)
             {
                 logger._log.Append(BodyLog);
             }

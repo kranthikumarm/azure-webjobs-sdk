@@ -12,5 +12,12 @@ namespace Microsoft.Azure.WebJobs.Description
     [AttributeUsage(AttributeTargets.Class)]
     public sealed class BindingAttribute : Attribute
     {
+        /// <summary>
+        /// Indicates that a trigger binding is capable of handling return values
+        /// from a function.
+        /// </summary>
+        /// $$$ Review this
+        [Obsolete("Will be redesigned in a future release.")]
+        public bool TriggerHandlesReturnValue { get; set; }
     }
 }

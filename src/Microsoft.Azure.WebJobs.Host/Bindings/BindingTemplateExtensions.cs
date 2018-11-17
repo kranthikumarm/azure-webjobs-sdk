@@ -6,6 +6,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
 using Microsoft.Azure.WebJobs.Host.Bindings.Path;
+using Microsoft.Azure.WebJobs.Host.Properties;
 
 namespace Microsoft.Azure.WebJobs.Host.Bindings
 {
@@ -14,16 +15,6 @@ namespace Microsoft.Azure.WebJobs.Host.Bindings
     /// </summary>
     public static class BindingTemplateExtensions
     {
-        internal static void ValidateContractCompatibility<TPath>(this IBindablePath<TPath> path, IReadOnlyDictionary<string, Type> bindingDataContract)
-        {
-            if (path == null)
-            {
-                throw new ArgumentNullException("path");
-            }
-
-            ValidateContractCompatibility(path.ParameterNames, bindingDataContract);
-        }
-
         /// <summary>
         /// Verifies that the specified binding contract contains contract members for each of the
         /// parameters in the specified <see cref="BindingTemplate"/>.
@@ -57,7 +48,7 @@ namespace Microsoft.Azure.WebJobs.Host.Bindings
             return bindingTemplate.Bind(bindingData);
         }
 
-        private static void ValidateContractCompatibility(IEnumerable<string> parameterNames, IReadOnlyDictionary<string, Type> bindingDataContract)
+        public static void ValidateContractCompatibility(IEnumerable<string> parameterNames, IReadOnlyDictionary<string, Type> bindingDataContract)
         {
             if (parameterNames != null && bindingDataContract != null)
             {
@@ -74,7 +65,7 @@ namespace Microsoft.Azure.WebJobs.Host.Bindings
 
                     if (!bindingDataContract.ContainsKey(parameterName))
                     {
-                        throw new InvalidOperationException(string.Format(CultureInfo.CurrentCulture, "No binding parameter exists for '{0}'.", parameterName));
+                        throw new InvalidOperationException(string.Format(CultureInfo.CurrentCulture, Resource.UnableToResolveBindingParameterFormat, parameterName));
                     }
                 }
             }
