@@ -4,23 +4,33 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Diagnostics.Tracing;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
 using System.Net;
+using System.Net.Http;
 using System.Reflection;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.ApplicationInsights;
+using Microsoft.ApplicationInsights.AspNetCore;
 using Microsoft.ApplicationInsights.Channel;
 using Microsoft.ApplicationInsights.DataContracts;
 using Microsoft.ApplicationInsights.Extensibility;
 using Microsoft.ApplicationInsights.Extensibility.Implementation;
 using Microsoft.ApplicationInsights.Extensibility.PerfCounterCollector.QuickPulse;
+using Microsoft.AspNetCore;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.Azure.WebJobs.Host.EndToEndTests.ApplicationInsights;
 using Microsoft.Azure.WebJobs.Host.TestCommon;
 using Microsoft.Azure.WebJobs.Logging;
+using Microsoft.Azure.WebJobs.Logging.ApplicationInsights;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -29,7 +39,7 @@ using Xunit;
 
 namespace Microsoft.Azure.WebJobs.Host.EndToEndTests
 {
-    public class ApplicationInsightsEndToEndTests : IDisposable
+    public class ApplicationInsightsEndToEndTests : IDisposable, IClassFixture<ApplicationInsightsEndToEndTests.CustomTestWebHostFactory>
     {
         private const string _mockApplicationInsightsUrl = "http://localhost:4005/v2/track/";
         private const string _mockQuickPulseUrl = "http://localhost:4005/QuickPulseService.svc/";
@@ -41,9 +51,24 @@ namespace Microsoft.Azure.WebJobs.Host.EndToEndTests
         private const string _customScopeValue = "MyCustomScopeValue";
 
         private const string _dateFormat = "HH':'mm':'ss'.'fffZ";
+        private const int _expectedResponseCode = 204;
 
-        private IHost ConfigureHost(LogLevel minLevel = LogLevel.Information)
+        private readonly CustomTestWebHostFactory _factory;
+        private static RequestTrackingTelemetryModule _requestModuleForFirstRequest;
+
+        public ApplicationInsightsEndToEndTests(CustomTestWebHostFactory factory)
         {
+            _factory = factory;
+            _requestModuleForFirstRequest = new RequestTrackingTelemetryModule();
+        }
+
+        private IHost ConfigureHost(LogLevel minLevel = LogLevel.Information, HttpAutoCollectionOptions httpOptions = null)
+        {
+            if (httpOptions == null)
+            {
+                httpOptions = new HttpAutoCollectionOptions();
+            }
+
             IHost host = new HostBuilder()
                 .ConfigureDefaultTestHost<ApplicationInsightsEndToEndTests>()
                 .ConfigureServices(services =>
@@ -56,7 +81,11 @@ namespace Microsoft.Azure.WebJobs.Host.EndToEndTests
                 .ConfigureLogging(b =>
                 {
                     b.SetMinimumLevel(minLevel);
-                    b.AddApplicationInsights(o => o.InstrumentationKey = _mockApplicationInsightsKey);
+                    b.AddApplicationInsightsWebJobs(o =>
+                    {
+                        o.InstrumentationKey = _mockApplicationInsightsKey;
+                        o.HttpAutoCollectionOptions = httpOptions;
+                    });
                 })
                 .ConfigureServices(services =>
                 {
@@ -88,13 +117,13 @@ namespace Microsoft.Azure.WebJobs.Host.EndToEndTests
                 await host.GetJobHost().CallAsync(methodInfo, new { input = "function input" });
                 await host.StopAsync();
 
-                Assert.Equal(11, _channel.Telemetries.Count);
+                Assert.Equal(16, _channel.Telemetries.Count);
 
                 // Validate the request
                 RequestTelemetry request = _channel.Telemetries
                     .OfType<RequestTelemetry>()
                     .Single();
-                ValidateRequest(request, testName, true);
+                ValidateRequest(request, testName, testName, null, null, true);
 
                 // invocation id is retrievable from the request
                 request.Properties.TryGetValue(LogConstants.InvocationIdKey, out string invocationId);
@@ -108,16 +137,22 @@ namespace Microsoft.Azure.WebJobs.Host.EndToEndTests
 
                 string expectedFunctionCategory = LogCategories.CreateFunctionCategory(testName);
                 string expectedFunctionUserCategory = LogCategories.CreateFunctionUserCategory(testName);
+                string expectedOperationId = request.Context.Operation.Id;
 
-                ValidateTrace(telemetries[0], "Executed ", expectedFunctionCategory, testName, invocationId);
-                ValidateTrace(telemetries[1], "Executing ", expectedFunctionCategory, testName, invocationId, request.Context.Operation.Id, request.Id);
-                ValidateTrace(telemetries[2], "Found the following functions:\r\n", LogCategories.Startup);
-                ValidateTrace(telemetries[3], "Job host started", LogCategories.Startup);
-                ValidateTrace(telemetries[4], "Job host stopped", LogCategories.Startup);
-                ValidateTrace(telemetries[5], "Logger", expectedFunctionUserCategory, testName, invocationId, request.Context.Operation.Id, request.Id, hasCustomScope: true);
-                ValidateTrace(telemetries[6], "Starting JobHost", "Microsoft.Azure.WebJobs.Hosting.JobHostService");
-                ValidateTrace(telemetries[7], "Stopping JobHost", "Microsoft.Azure.WebJobs.Hosting.JobHostService");
-                ValidateTrace(telemetries[8], "Trace", expectedFunctionUserCategory, testName, invocationId, request.Context.Operation.Id, request.Id);
+                ValidateTrace(telemetries[0], "ApplicationInsightsLoggerOptions", "Microsoft.Azure.WebJobs.Hosting.OptionsLoggingService");
+                ValidateTrace(telemetries[1], "Executed ", expectedFunctionCategory, testName, invocationId, expectedOperationId, request.Id);
+                ValidateTrace(telemetries[2], "Executing ", expectedFunctionCategory, testName, invocationId, expectedOperationId, request.Id);
+                ValidateTrace(telemetries[3], "Found the following functions:\r\n", LogCategories.Startup);
+                ValidateTrace(telemetries[4], "FunctionResultAggregatorOptions", "Microsoft.Azure.WebJobs.Hosting.OptionsLoggingService");
+                ValidateTrace(telemetries[5], "Job host started", LogCategories.Startup);
+                ValidateTrace(telemetries[6], "Job host stopped", LogCategories.Startup);
+                ValidateTrace(telemetries[7], "Logger", expectedFunctionUserCategory, testName, invocationId, expectedOperationId, request.Id, hasCustomScope: true);
+                ValidateTrace(telemetries[8], "LoggerFilterOptions", "Microsoft.Azure.WebJobs.Hosting.OptionsLoggingService");
+                ValidateTrace(telemetries[9], "LoggerFilterOptions", "Microsoft.Azure.WebJobs.Hosting.OptionsLoggingService");
+                ValidateTrace(telemetries[10], "SingletonOptions", "Microsoft.Azure.WebJobs.Hosting.OptionsLoggingService");
+                ValidateTrace(telemetries[11], "Starting JobHost", "Microsoft.Azure.WebJobs.Hosting.JobHostService");
+                ValidateTrace(telemetries[12], "Stopping JobHost", "Microsoft.Azure.WebJobs.Hosting.JobHostService");
+                ValidateTrace(telemetries[13], "Trace", expectedFunctionUserCategory, testName, invocationId, expectedOperationId, request.Id);
 
                 // We should have 1 custom metric.
                 MetricTelemetry metric = _channel.Telemetries
@@ -139,13 +174,13 @@ namespace Microsoft.Azure.WebJobs.Host.EndToEndTests
                 await Assert.ThrowsAsync<FunctionInvocationException>(() => host.GetJobHost().CallAsync(methodInfo, new { input = "function input" }));
                 await host.StopAsync();
 
-                Assert.Equal(14, _channel.Telemetries.Count);
+                Assert.Equal(19, _channel.Telemetries.Count);
 
                 // Validate the request
                 RequestTelemetry request = _channel.Telemetries
                     .OfType<RequestTelemetry>()
                     .Single();
-                ValidateRequest(request, testName, false);
+                ValidateRequest(request, testName, testName, null, null, false);
 
                 // invocation id is retrievable from the request
                 request.Properties.TryGetValue(LogConstants.InvocationIdKey, out string invocationId);
@@ -159,17 +194,23 @@ namespace Microsoft.Azure.WebJobs.Host.EndToEndTests
 
                 string expectedFunctionCategory = LogCategories.CreateFunctionCategory(testName);
                 string expectedFunctionUserCategory = LogCategories.CreateFunctionUserCategory(testName);
+                string expectedOperationId = request.Context.Operation.Id;
 
-                ValidateTrace(telemetries[0], "Error", expectedFunctionUserCategory, testName, invocationId, request.Context.Operation.Id, request.Id, expectedLogLevel: LogLevel.Error);
-                ValidateTrace(telemetries[1], "Executed", expectedFunctionCategory, testName, invocationId, expectedLogLevel: LogLevel.Error);
-                ValidateTrace(telemetries[2], "Executing", expectedFunctionCategory, testName, invocationId, request.Context.Operation.Id, request.Id);
-                ValidateTrace(telemetries[3], "Found the following functions:\r\n", LogCategories.Startup);
-                ValidateTrace(telemetries[4], "Job host started", LogCategories.Startup);
-                ValidateTrace(telemetries[5], "Job host stopped", LogCategories.Startup);
-                ValidateTrace(telemetries[6], "Logger", expectedFunctionUserCategory, testName, invocationId, request.Context.Operation.Id, request.Id, hasCustomScope: true);
-                ValidateTrace(telemetries[7], "Starting JobHost", "Microsoft.Azure.WebJobs.Hosting.JobHostService");
-                ValidateTrace(telemetries[8], "Stopping JobHost", "Microsoft.Azure.WebJobs.Hosting.JobHostService");
-                ValidateTrace(telemetries[9], "Trace", expectedFunctionUserCategory, testName, invocationId, request.Context.Operation.Id, request.Id);
+                ValidateTrace(telemetries[0], "ApplicationInsightsLoggerOptions", "Microsoft.Azure.WebJobs.Hosting.OptionsLoggingService");
+                ValidateTrace(telemetries[1], "Error", expectedFunctionUserCategory, testName, invocationId, expectedOperationId, request.Id, expectedLogLevel: LogLevel.Error);
+                ValidateTrace(telemetries[2], "Executed", expectedFunctionCategory, testName, invocationId, expectedOperationId, request.Id, expectedLogLevel: LogLevel.Error);
+                ValidateTrace(telemetries[3], "Executing", expectedFunctionCategory, testName, invocationId, expectedOperationId, request.Id);
+                ValidateTrace(telemetries[4], "Found the following functions:\r\n", LogCategories.Startup);
+                ValidateTrace(telemetries[5], "FunctionResultAggregatorOptions", "Microsoft.Azure.WebJobs.Hosting.OptionsLoggingService");
+                ValidateTrace(telemetries[6], "Job host started", LogCategories.Startup);
+                ValidateTrace(telemetries[7], "Job host stopped", LogCategories.Startup);
+                ValidateTrace(telemetries[8], "Logger", expectedFunctionUserCategory, testName, invocationId, expectedOperationId, request.Id, hasCustomScope: true);
+                ValidateTrace(telemetries[9], "LoggerFilterOptions", "Microsoft.Azure.WebJobs.Hosting.OptionsLoggingService");
+                ValidateTrace(telemetries[10], "LoggerFilterOptions", "Microsoft.Azure.WebJobs.Hosting.OptionsLoggingService");
+                ValidateTrace(telemetries[11], "SingletonOptions", "Microsoft.Azure.WebJobs.Hosting.OptionsLoggingService");
+                ValidateTrace(telemetries[12], "Starting JobHost", "Microsoft.Azure.WebJobs.Hosting.JobHostService");
+                ValidateTrace(telemetries[13], "Stopping JobHost", "Microsoft.Azure.WebJobs.Hosting.JobHostService");
+                ValidateTrace(telemetries[14], "Trace", expectedFunctionUserCategory, testName, invocationId, expectedOperationId, request.Id);
 
                 // Validate the exception
                 ExceptionTelemetry[] exceptions = _channel.Telemetries
@@ -177,15 +218,15 @@ namespace Microsoft.Azure.WebJobs.Host.EndToEndTests
                     .OrderBy(t => t.Timestamp)
                     .ToArray();
                 Assert.Equal(3, exceptions.Length);
-                ValidateException(exceptions[0], expectedFunctionUserCategory, testName, request.Context.Operation.Id, request.Id);
-                ValidateException(exceptions[1], LogCategories.Results, testName, request.Context.Operation.Id, request.Id);
-                ValidateException(exceptions[2], expectedFunctionCategory, testName, null, null);
+                ValidateException(exceptions[0], expectedFunctionUserCategory, testName, expectedOperationId, request.Id);
+                ValidateException(exceptions[1], expectedFunctionCategory, testName, expectedOperationId, request.Id);
+                ValidateException(exceptions[2], LogCategories.Results, testName, expectedOperationId, request.Id);
             }
         }
 
         [Theory]
         [InlineData(LogLevel.None, 0, 0)]
-        [InlineData(LogLevel.Information, 5, 5)] // 3 start, 2 stop, 4x traces per request, 1x requests
+        [InlineData(LogLevel.Information, 5, 10)] // 5 start, 2 stop, 4x traces per request, 1x requests
         [InlineData(LogLevel.Warning, 2, 0)] // 2x warning trace per request
         public async Task QuickPulse_Works_EvenIfFiltered(LogLevel defaultLevel, int tracesPerRequest, int additionalTraces)
         {
@@ -250,21 +291,24 @@ namespace Microsoft.Azure.WebJobs.Host.EndToEndTests
                     listener.Dispose();
                 }
 
-                string failureString = string.Join(Environment.NewLine, _channel.Telemetries.Select(t =>
+                string GetFailureString()
                 {
-                    string timestamp = $"[{t.Timestamp.ToString(_dateFormat)}] ";
-                    switch (t)
-                    {
-                        case DependencyTelemetry dependency:
-                            return timestamp + $"[Dependency] {dependency.Name}; {dependency.Target}; {dependency.Data}";
-                        case TraceTelemetry trace:
-                            return timestamp + $"[Trace] {trace.Message}";
-                        case RequestTelemetry request:
-                            return timestamp + $"[Request] {request.Name}: {request.Success}";
-                        default:
-                            return timestamp + $"[{t.GetType().Name}]";
-                    }
-                }));
+                    return string.Join(Environment.NewLine, _channel.Telemetries.OrderBy(p => p.Timestamp).Select(t =>
+                      {
+                          string timestamp = $"[{t.Timestamp.ToString(_dateFormat)}] ";
+                          switch (t)
+                          {
+                              case DependencyTelemetry dependency:
+                                  return timestamp + $"[Dependency] {dependency.Name}; {dependency.Target}; {dependency.Data}";
+                              case TraceTelemetry trace:
+                                  return timestamp + $"[Trace] {trace.Message}";
+                              case RequestTelemetry request:
+                                  return timestamp + $"[Request] {request.Name}: {request.Success}";
+                              default:
+                                  return timestamp + $"[{t.GetType().Name}]";
+                          }
+                      }));
+                }
 
                 int expectedTelemetryItems = additionalTraces + (functionsCalled * tracesPerRequest);
 
@@ -273,8 +317,9 @@ namespace Microsoft.Azure.WebJobs.Host.EndToEndTests
                 var actualTelemetries = _channel.Telemetries
                     .Where(p => !(p is DependencyTelemetry d && d.Name == "POST /api/tests/batch"))
                     .ToArray();
+
                 Assert.True(actualTelemetries.Length == expectedTelemetryItems,
-                   $"Expected: {expectedTelemetryItems}; Actual: {actualTelemetries.Length}{Environment.NewLine}{failureString}");
+                    $"Expected: {expectedTelemetryItems}; Actual: {actualTelemetries.Length}{Environment.NewLine}{GetFailureString()}");
             }
         }
 
@@ -313,9 +358,10 @@ namespace Microsoft.Azure.WebJobs.Host.EndToEndTests
                 RequestTelemetry outerRequest = null;
 
                 // simulate auto tracked HTTP incoming call
-                using (IOperationHolder<RequestTelemetry> operation = telemetryClient.StartOperation<RequestTelemetry>("GET /"))
+                using (IOperationHolder<RequestTelemetry> operation = telemetryClient.StartOperation<RequestTelemetry>("request name"))
                 {
                     outerRequest = operation.Telemetry;
+                    outerRequest.Url = new Uri("http://my-func/api/func-name?name=123");
                     outerRequest.Success = true;
                     await host.GetJobHost().CallAsync(methodInfo, new { input = "input" });
                 }
@@ -330,10 +376,296 @@ namespace Microsoft.Azure.WebJobs.Host.EndToEndTests
                 RequestTelemetry functionRequest = requestTelemetries.Single();
                 Assert.Same(outerRequest, functionRequest);
 
-                ValidateRequest(functionRequest, testName, true);
+                Assert.True(double.TryParse(functionRequest.Properties[LogConstants.FunctionExecutionTimeKey], out double functionDuration));
+                Assert.True(functionRequest.Duration.TotalMilliseconds >= functionDuration);
+                Assert.Equal("0.0.0.0", functionRequest.Context.Location.Ip);
+                ValidateRequest(functionRequest, testName, testName, "GET", "/api/func-name", true, "0");
             }
         }
 
+        [Theory]
+        [InlineData(nameof(TestApplicationInsightsInformation), true)]
+        [InlineData(nameof(TestApplicationInsightsFailure), false)]
+        public async Task ApplicationInsights_HttpRequestTrackingByWebJobs(string testName, bool success)
+        {
+            var client = _factory.CreateClient();
+            var httpOptions = new HttpAutoCollectionOptions
+            {
+                EnableHttpTriggerExtendedInfoCollection = false
+            };
+
+            using (IHost host = ConfigureHost(httpOptions: httpOptions))
+            {
+                Startup.Host = host;
+                await host.StartAsync();
+
+                var loggerProvider = host.Services.GetServices<ILoggerProvider>().OfType<ApplicationInsightsLoggerProvider>().Single();
+                var logger = loggerProvider.CreateLogger(LogCategories.Results);
+
+                var request = new HttpRequestMessage(HttpMethod.Get, $"/some/path?name={testName}");
+                request.Headers.Add("traceparent", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01");
+
+                var mockHttpContext = new DefaultHttpContext();
+                mockHttpContext.Connection.RemoteIpAddress = new IPAddress(new byte[] { 1, 2, 3, 4 });
+
+                // simulate functions behavior to set request on the scope
+                using (var _ = logger.BeginScope(new Dictionary<string, object> { ["MS_HttpRequest"] = mockHttpContext.Request }))
+                {
+                    await client.SendAsync(request);
+                }
+
+                await host.StopAsync();
+
+                // Validate the request
+                // There must be only one reported by the AppInsights request collector
+                // The telemetry may come back slightly later, so wait until we see it
+                RequestTelemetry functionRequest = null;
+                await TestHelpers.Await(() =>
+                {
+                    functionRequest = _channel.Telemetries.OfType<RequestTelemetry>().SingleOrDefault();
+                    return functionRequest != null;
+                });
+
+                Assert.True(double.TryParse(functionRequest.Properties[LogConstants.FunctionExecutionTimeKey], out double functionDuration));
+                Assert.True(functionRequest.Duration.TotalMilliseconds >= functionDuration);
+                Assert.Equal("1.2.3.4", functionRequest.Context.Location.Ip);
+                Assert.Null(functionRequest.Url);
+
+                ValidateRequest(
+                    functionRequest,
+                    testName,
+                    testName,
+                    null,
+                    null,
+                    success);
+
+                // Make sure operation ids match
+                var traces = _channel.Telemetries.OfType<TraceTelemetry>()
+                    .Where(t => t.Context.Operation.Id == functionRequest.Context.Operation.Id);
+                Assert.Equal(success ? 4 : 5, traces.Count());
+            }
+        }
+
+        [Theory]
+        [InlineData(nameof(TestApplicationInsightsInformation), true)]
+        [InlineData(nameof(TestApplicationInsightsFailure), false)]
+        public async Task ApplicationInsights_HttpRequestTrackingByAIAutoCollector(string testName, bool success)
+        {
+            var client = _factory.CreateClient();
+
+            using (IHost host = ConfigureHost())
+            {
+                Startup.Host = host;
+                await host.StartAsync();
+
+                var loggerProvider = host.Services.GetServices<ILoggerProvider>().OfType<ApplicationInsightsLoggerProvider>().Single();
+                var logger = loggerProvider.CreateLogger(LogCategories.Results);
+
+                var request = new HttpRequestMessage(HttpMethod.Get, $"/some/path?name={testName}");
+                request.Headers.Add("traceparent", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01");
+
+                var mockHttpContext = new DefaultHttpContext();
+                mockHttpContext.Connection.RemoteIpAddress = new IPAddress(new byte[] {1, 2, 3, 4});
+
+                // simulate functions behavior to set request on the scope
+                using (var _ = logger.BeginScope(new Dictionary<string, object> { ["MS_HttpRequest"] = mockHttpContext.Request}))
+                {
+                    await client.SendAsync(request);
+                }
+
+                await host.StopAsync();
+
+                // Validate the request
+                // There must be only one reported by the AppInsights request collector
+                // The telemetry may come back slightly later, so wait until we see it
+                RequestTelemetry functionRequest = null;
+                await TestHelpers.Await(() =>
+                {
+                    functionRequest = _channel.Telemetries.OfType<RequestTelemetry>().SingleOrDefault();
+                    return functionRequest != null;
+                });
+
+                Assert.True(double.TryParse(functionRequest.Properties[LogConstants.FunctionExecutionTimeKey], out double functionDuration));
+                Assert.True(functionRequest.Duration.TotalMilliseconds >= functionDuration);
+                Assert.Equal("1.2.3.4", functionRequest.Context.Location.Ip);
+                Assert.Equal("http://localhost/some/path", functionRequest.Url.ToString());
+                
+                ValidateRequest(
+                    functionRequest,
+                    testName,
+                    testName,
+                    "GET",
+                    "/some/path",
+                    success,
+                    "204",
+                    "4bf92f3577b34da6a3ce929d0e0e4736",
+                    "|4bf92f3577b34da6a3ce929d0e0e4736.00f067aa0ba902b7.");
+
+                Assert.DoesNotContain("MS_HttpRequest", functionRequest.Properties.Keys);
+                // Make sure operation ids match
+                var traces = _channel.Telemetries.OfType<TraceTelemetry>()
+                    .Where(t => t.Context.Operation.Id == functionRequest.Context.Operation.Id);
+                Assert.Equal(success ? 4 : 5, traces.Count());
+            }
+        }
+
+        [Fact]
+        public async Task ApplicationInsights_HttpRequestTrackingByWebJobsFirstRequest()
+        {
+            var client = _factory.CreateClient();
+            var httpOptions = new HttpAutoCollectionOptions
+            {
+                EnableHttpTriggerExtendedInfoCollection = false
+            };
+
+            // simulate functions workaround to track first cold requests
+            _requestModuleForFirstRequest.Initialize(null);
+
+            using (IHost host = ConfigureHost(httpOptions: httpOptions))
+            {
+                Startup.Host = host;
+                await host.StartAsync();
+
+                var request = new HttpRequestMessage(HttpMethod.Get, $"/some/path?name={nameof(TestApplicationInsightsDisposeRequestsModule)}");
+
+                await client.SendAsync(request);
+
+                await host.StopAsync();
+
+                // Validate the request
+                // There must be only one reported by the AppInsights request collector
+                // The telemetry may come back slightly later, so wait until we see it
+                RequestTelemetry functionRequest = null;
+                await TestHelpers.Await(() =>
+                {
+                    functionRequest = _channel.Telemetries.OfType<RequestTelemetry>().SingleOrDefault();
+                    return functionRequest != null;
+                });
+
+                Assert.True(double.TryParse(functionRequest.Properties[LogConstants.FunctionExecutionTimeKey], out double functionDuration));
+                Assert.True(functionRequest.Duration.TotalMilliseconds >= functionDuration);
+                Assert.Null(functionRequest.Url);
+
+                ValidateRequest(
+                    functionRequest,
+                    nameof(TestApplicationInsightsDisposeRequestsModule),
+                    nameof(TestApplicationInsightsDisposeRequestsModule),
+                    null,
+                    null,
+                    true);
+
+                // Make sure operation ids match
+                var traces = _channel.Telemetries.OfType<TraceTelemetry>()
+                    .Where(t => t.Context.Operation.Id == functionRequest.Context.Operation.Id);
+                Assert.Equal(2, traces.Count());
+            }
+        }
+
+        [Fact]
+        public async Task ApplicationInsights_HttpRequestTrackingByAIAutoCollectorFirstRequest()
+        {
+            var client = _factory.CreateClient();
+
+            // simulate functions workaround to track first cold requests
+            _requestModuleForFirstRequest.Initialize(null);
+
+            using (IHost host = ConfigureHost())
+            {
+                Startup.Host = host;
+                await host.StartAsync();
+
+                var request = new HttpRequestMessage(HttpMethod.Get, $"/some/path?name={nameof(TestApplicationInsightsDisposeRequestsModule)}");
+
+                await client.SendAsync(request);
+
+                await host.StopAsync();
+
+                // Validate the request
+                // There must be only one reported by the AppInsights request collector
+                // The telemetry may come back slightly later, so wait until we see it
+                RequestTelemetry functionRequest = null;
+                await TestHelpers.Await(() =>
+                {
+                    functionRequest = _channel.Telemetries.OfType<RequestTelemetry>().SingleOrDefault();
+                    return functionRequest != null;
+                });
+
+                Assert.True(double.TryParse(functionRequest.Properties[LogConstants.FunctionExecutionTimeKey], out double functionDuration));
+                Assert.True(functionRequest.Duration.TotalMilliseconds >= functionDuration);
+                Assert.Equal("http://localhost/some/path", functionRequest.Url.ToString());
+
+                ValidateRequest(
+                    functionRequest,
+                    nameof(TestApplicationInsightsDisposeRequestsModule),
+                    nameof(TestApplicationInsightsDisposeRequestsModule),
+                    "GET",
+                    "/some/path",
+                    true,
+                    "204");
+
+                // Make sure operation ids match
+                var traces = _channel.Telemetries.OfType<TraceTelemetry>()
+                    .Where(t => t.Context.Operation.Id == functionRequest.Context.Operation.Id);
+                Assert.Equal(2, traces.Count());
+            }
+        }
+
+        [Fact]
+        public async Task ApplicationInsights_HttpRequestTracking_IgnoresDuplicateRequests()
+        {
+            // During Functions host shutdown/restart events, it's possible to have two 
+            // simultaneous running hosts for a very short period. We need to make sure we don't
+            // double-log any of the auto-tracked Requests.
+
+            var client = _factory.CreateClient();
+
+            // Create two hosts to simulate.
+            using (IHost host1 = ConfigureHost())
+            {
+                using (IHost host2 = ConfigureHost())
+                {
+                    Startup.Host = host2;
+                    await host1.StartAsync();
+                    await host2.StartAsync();
+
+                    string testName = nameof(TestApplicationInsightsInformation);
+
+                    var request = new HttpRequestMessage(HttpMethod.Get, $"/some/path?name={testName}");
+                    request.Headers.Add("traceparent", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01");
+
+                    await client.SendAsync(request);
+
+                    await host1.StopAsync();
+                    await host2.StopAsync();
+
+                    // Validate the request
+                    // There must be only one reported by the AppInsights request collector
+                    // The telemetry may come back slightly later, so wait until we see it
+                    RequestTelemetry functionRequest = null;
+                    await TestHelpers.Await(() =>
+                    {
+                        functionRequest = _channel.Telemetries.OfType<RequestTelemetry>().SingleOrDefault();
+                        return functionRequest != null;
+                    });
+
+                    Assert.True(double.TryParse(functionRequest.Properties[LogConstants.FunctionExecutionTimeKey], out double functionDuration));
+                    Assert.True(functionRequest.Duration.TotalMilliseconds >= functionDuration);
+                    ValidateRequest(
+                        functionRequest,
+                        testName,
+                        testName,
+                        "GET",
+                        "/some/path",
+                        true,
+                        "204",
+                        "4bf92f3577b34da6a3ce929d0e0e4736",
+                        "|4bf92f3577b34da6a3ce929d0e0e4736.00f067aa0ba902b7.");
+
+                    Assert.Equal(_expectedResponseCode.ToString(), functionRequest.ResponseCode);
+                }
+            }
+        }
+        
         // Test Functions
         [NoAutomaticTrigger]
         public static void TestApplicationInsightsInformation(string input, TraceWriter trace, ILogger logger)
@@ -387,6 +719,12 @@ namespace Microsoft.Azure.WebJobs.Host.EndToEndTests
             TelemetryClient telemetryClient = new TelemetryClient(); // use TelemetryConfiguration.Active
             telemetryClient.TrackEvent("custom event");
         }
+        
+        [NoAutomaticTrigger]
+        public static void TestApplicationInsightsDisposeRequestsModule(string input, ILogger logger)
+        {
+            _requestModuleForFirstRequest.Dispose();
+        }
 
         private static void ValidateMetric(MetricTelemetry telemetry, string expectedOperationName)
         {
@@ -404,7 +742,7 @@ namespace Microsoft.Azure.WebJobs.Host.EndToEndTests
             Assert.Equal("100", telemetry.Properties[$"{LogConstants.CustomPropertyPrefix}MyCustomMetricProperty"]);
             ValidateCustomScopeProperty(telemetry);
 
-            ValidateSdkVersion(telemetry);
+            ValidateSdkVersion(telemetry, "af_");
         }
 
         private static void ValidateCustomScopeProperty(ISupportProperties telemetry)
@@ -656,7 +994,8 @@ namespace Microsoft.Azure.WebJobs.Host.EndToEndTests
             ValidateSdkVersion(telemetry);
         }
 
-        private static void ValidateRequest(RequestTelemetry telemetry, string operationName, bool success)
+        private static void ValidateRequest(RequestTelemetry telemetry, string operationName, string name, string httpMethod, string requestPath, bool success, string statusCode = "0",
+            string operationId = null, string parentId = null)
         {
             Assert.NotNull(telemetry.Context.Operation.Id);
             Assert.Equal(operationName, telemetry.Context.Operation.Name);
@@ -668,12 +1007,13 @@ namespace Microsoft.Azure.WebJobs.Host.EndToEndTests
             Assert.Equal($"ApplicationInsightsEndToEndTests.{operationName}", telemetry.Properties[LogConstants.FullNameKey]);
             Assert.Equal("This function was programmatically called via the host APIs.", telemetry.Properties[LogConstants.TriggerReasonKey]);
 
-            ValidateSdkVersion(telemetry);
+            TelemetryValidationHelpers.ValidateRequest(telemetry, operationName, name, operationId, parentId, LogCategories.Results,
+                success ? LogLevel.Information : LogLevel.Error, success, statusCode);
         }
 
-        private static void ValidateSdkVersion(ITelemetry telemetry)
-        {
-            Assert.StartsWith("webjobs: ", telemetry.Context.GetInternalContext().SdkVersion);
+        private static void ValidateSdkVersion(ITelemetry telemetry, string prefix = null)
+        {            
+            Assert.StartsWith($"{prefix}webjobs:", telemetry.Context.GetInternalContext().SdkVersion);
         }
 
         private class QuickPulsePayload
@@ -742,6 +1082,57 @@ namespace Microsoft.Azure.WebJobs.Host.EndToEndTests
         public void Dispose()
         {
             _channel?.Dispose();
+
+            while (Activity.Current != null)
+            {
+                Activity.Current.Stop();
+            }
+        }
+
+
+        public class Startup
+        {
+            public static IHost Host;
+
+            public void ConfigureServices(IServiceCollection services)
+            {
+            }
+
+            public void Configure(IApplicationBuilder app, AspNetCore.Hosting.IHostingEnvironment env)
+            {
+                app.Run(async (context) =>
+                {
+                    MethodInfo methodInfo = typeof(ApplicationInsightsEndToEndTests).GetMethod(context.Request.Query["name"], BindingFlags.Public | BindingFlags.Static);
+
+                    try
+                    {
+                        await Host.GetJobHost().CallAsync(methodInfo, new {input = "input"});
+                    }
+                    catch
+                    {
+                        // Ignore this, it shouldn't matter what is returned as we'll log the
+                        // result of the function invocation no matter what.
+                    }
+
+                    context.Response.StatusCode = _expectedResponseCode;
+                    await context.Response.WriteAsync("Hello World!");
+                });
+            }
+        }
+
+        public class CustomTestWebHostFactory : WebApplicationFactory<ApplicationInsightsEndToEndTests.Startup>
+        {
+            protected override IWebHostBuilder CreateWebHostBuilder()
+            {
+                return WebHost.CreateDefaultBuilder()
+                    .UseStartup<ApplicationInsightsEndToEndTests.Startup>();
+            }
+
+            protected override void ConfigureWebHost(IWebHostBuilder builder)
+            {
+                builder.UseContentRoot(".");
+                base.ConfigureWebHost(builder);
+            }
         }
     }
 }

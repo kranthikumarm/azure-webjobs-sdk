@@ -8,12 +8,14 @@ using System.Globalization;
 using System.Text;
 using Microsoft.Azure.EventHubs;
 using Microsoft.Azure.EventHubs.Processor;
+using Microsoft.Azure.WebJobs.Hosting;
 using Microsoft.Extensions.Configuration;
-using Microsoft.Extensions.Options;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 
 namespace Microsoft.Azure.WebJobs.EventHubs
 {
-    public class EventHubOptions
+    public class EventHubOptions : IOptionsFormatter
     {
         // Event Hub Names are case-insensitive.
         // The same path can have multiple connection strings with different permissions (sending and receiving), 
@@ -35,6 +37,7 @@ namespace Microsoft.Azure.WebJobs.EventHubs
         public EventHubOptions()
         {
             EventProcessorOptions = EventProcessorOptions.DefaultOptions;
+            PartitionManagerOptions = new PartitionManagerOptions();
         }
 
         /// <summary>
@@ -58,6 +61,8 @@ namespace Microsoft.Azure.WebJobs.EventHubs
         }
 
         public EventProcessorOptions EventProcessorOptions { get; }
+
+        public PartitionManagerOptions PartitionManagerOptions { get; }
 
         /// <summary>
         /// Add an existing client for sending messages to an event hub.  Infer the eventHub name from client.path
@@ -253,6 +258,8 @@ namespace Microsoft.Azure.WebJobs.EventHubs
                     leaseContainerName: LeaseContainerName,
                     storageBlobPrefix: blobPrefix);
 
+                host.PartitionManagerOptions = PartitionManagerOptions;
+
                 return host;
             }
             else
@@ -349,6 +356,41 @@ namespace Microsoft.Azure.WebJobs.EventHubs
 
             string key = EscapeBlobPath(serviceBusNamespace) + "/" + EscapeBlobPath(eventHubName) + "/";
             return key;
+        }
+
+        public string Format()
+        {
+            JObject eventProcessorOptions = null;
+            if (EventProcessorOptions != null)
+            {
+                eventProcessorOptions = new JObject
+                {
+                    { nameof(EventProcessorOptions.EnableReceiverRuntimeMetric), EventProcessorOptions.EnableReceiverRuntimeMetric },
+                    { nameof(EventProcessorOptions.InvokeProcessorAfterReceiveTimeout), EventProcessorOptions.InvokeProcessorAfterReceiveTimeout },
+                    { nameof(EventProcessorOptions.MaxBatchSize), EventProcessorOptions.MaxBatchSize },
+                    { nameof(EventProcessorOptions.PrefetchCount), EventProcessorOptions.PrefetchCount },
+                    { nameof(EventProcessorOptions.ReceiveTimeout), EventProcessorOptions.ReceiveTimeout }
+                };
+            }
+
+            JObject partitionManagerOptions = null;
+            if (PartitionManagerOptions != null)
+            {
+                partitionManagerOptions = new JObject
+                {
+                    { nameof(PartitionManagerOptions.LeaseDuration), PartitionManagerOptions.LeaseDuration },
+                    { nameof(PartitionManagerOptions.RenewInterval), PartitionManagerOptions.RenewInterval },
+                };
+            }
+
+            JObject options = new JObject
+            {
+                { nameof(BatchCheckpointFrequency), BatchCheckpointFrequency },
+                { nameof(EventProcessorOptions), eventProcessorOptions },
+                { nameof(PartitionManagerOptions), partitionManagerOptions }
+            };
+
+            return options.ToString(Formatting.Indented);
         }
 
         // Hold credentials for a given eventHub name. 

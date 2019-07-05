@@ -18,6 +18,7 @@ using Microsoft.Azure.WebJobs.Host.Properties;
 using Microsoft.Azure.WebJobs.Host.Protocols;
 using Microsoft.Azure.WebJobs.Host.Triggers;
 using Microsoft.Azure.WebJobs.Logging;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 
 namespace Microsoft.Azure.WebJobs.Host.Indexers
@@ -44,7 +45,6 @@ namespace Microsoft.Azure.WebJobs.Host.Indexers
             IBindingProvider bindingProvider,
             IJobActivator activator,
             IFunctionExecutor executor,
-            IExtensionRegistry extensions,
             SingletonManager singletonManager,
             ILoggerFactory loggerFactory,
             INameResolver nameResolver = null,
@@ -52,41 +52,11 @@ namespace Microsoft.Azure.WebJobs.Host.Indexers
             TimeoutAttribute defaultTimeout = null,
             bool allowPartialHostStartup = false)
         {
-            if (triggerBindingProvider == null)
-            {
-                throw new ArgumentNullException("triggerBindingProvider");
-            }
-
-            if (bindingProvider == null)
-            {
-                throw new ArgumentNullException("bindingProvider");
-            }
-
-            if (activator == null)
-            {
-                throw new ArgumentNullException("activator");
-            }
-
-            if (executor == null)
-            {
-                throw new ArgumentNullException("executor");
-            }
-
-            if (extensions == null)
-            {
-                throw new ArgumentNullException("extensions");
-            }
-
-            if (singletonManager == null)
-            {
-                throw new ArgumentNullException("singletonManager");
-            }
-
-            _triggerBindingProvider = triggerBindingProvider;
-            _bindingProvider = bindingProvider;
-            _activator = activator;
-            _executor = executor;
-            _singletonManager = singletonManager;
+            _triggerBindingProvider = triggerBindingProvider ?? throw new ArgumentNullException(nameof(triggerBindingProvider));
+            _bindingProvider = bindingProvider ?? throw new ArgumentNullException(nameof(bindingProvider));
+            _activator = activator ?? throw new ArgumentNullException(nameof(activator));
+            _executor = executor ?? throw new ArgumentNullException(nameof(executor));
+            _singletonManager = singletonManager ?? throw new ArgumentNullException(nameof(singletonManager));
             _nameResolver = nameResolver;
             _logger = loggerFactory?.CreateLogger(LogCategories.Startup);
             _sharedQueue = sharedQueue;
@@ -113,7 +83,7 @@ namespace Microsoft.Azure.WebJobs.Host.Indexers
 
                     // If recoverable, continue to the rest of the methods.
                     // The method in error simply won't be running in the JobHost.
-                    string msg = $"Function '{method.GetShortName()}' failed indexing and will be disabled.";
+                    string msg = $"Function '{Utility.GetFunctionShortName(method)}' failed indexing and will be disabled.";
                     _logger?.LogWarning(msg);
                     continue;
                 }
@@ -172,7 +142,7 @@ namespace Microsoft.Azure.WebJobs.Host.Indexers
             }
             catch (Exception exception)
             {
-                throw new FunctionIndexingException(method.GetShortName(), exception);
+                throw new FunctionIndexingException(Utility.GetFunctionShortName(method), exception);
             }
         }
 
@@ -209,7 +179,7 @@ namespace Microsoft.Azure.WebJobs.Host.Indexers
             if (triggerBinding != null)
             {
                 bindingDataContract = triggerBinding.BindingDataContract;
-                
+
                 // See if a regular binding can handle it. 
                 IBinding binding = await _bindingProvider.TryCreateAsync(new BindingProviderContext(triggerParameter, bindingDataContract, cancellationToken));
                 if (binding != null)
@@ -228,7 +198,7 @@ namespace Microsoft.Azure.WebJobs.Host.Indexers
             ReturnParameterInfo returnParameter = null;
             bool triggerHasReturnBinding = false;
 
-            if (TypeUtility.TryGetReturnType(method, out Type methodReturnType))
+            if (TypeUtility.TryGetReturnType(method, out Type methodReturnType) && !IsUnitType(methodReturnType))
             {
                 if (bindingDataContract != null && bindingDataContract.TryGetValue(ReturnParamName, out Type triggerReturnType))
                 {
@@ -310,7 +280,7 @@ namespace Microsoft.Azure.WebJobs.Host.Indexers
 
             if (TypeUtility.IsAsyncVoid(method))
             {
-                string msg = $"Function '{method.Name}' is async but does not return a Task. Your function may not run correctly.";
+                string msg = $"Function '{Utility.GetFunctionShortName(method)}' is async but does not return a Task. Your function may not run correctly.";
                 _logger?.LogWarning(msg);
             }
 
@@ -350,9 +320,16 @@ namespace Microsoft.Azure.WebJobs.Host.Indexers
             index.Add(functionDefinition, functionDescriptor, method);
         }
 
+        /// <summary>
+        /// Verifies if the provided type is the F# Unit type by performing a type name comparison.
+        /// </summary>
+        /// <param name="type">The type to be checked.</param>
+        /// <returns>True if the type name matches the F# unit type; otherwise, false.</returns>
+        private bool IsUnitType(Type type) => string.Equals(type?.FullName, "Microsoft.FSharp.Core.Unit", StringComparison.Ordinal);
+
         private FunctionDefinition CreateTriggeredFunctionDefinition<TTriggerValue>(
             ITriggerBinding triggerBinding, string parameterName, FunctionDescriptor descriptor,
-            IReadOnlyDictionary<string, IBinding> nonTriggerBindings, IFunctionInvoker invoker)
+            IReadOnlyDictionary<string, IBinding> nonTriggerBindings, IFunctionInvokerEx invoker)
         {
             ITriggeredFunctionBinding<TTriggerValue> functionBinding = new TriggeredFunctionBinding<TTriggerValue>(descriptor, parameterName, triggerBinding, nonTriggerBindings, _singletonManager);
             ITriggeredFunctionInstanceFactory<TTriggerValue> instanceFactory = new TriggeredFunctionInstanceFactory<TTriggerValue>(functionBinding, invoker, descriptor);
